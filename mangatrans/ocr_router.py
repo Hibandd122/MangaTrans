@@ -4,20 +4,19 @@ Engines hỗ trợ:
   - paddleocr (PP-OCRv5, accuracy cao cho Latin + zh, primary cho en/vi/zh)
   - easyocr   (multi-lang, fallback hoặc primary cho ko)
   - manga-ocr (Nhật, accuracy cao cho kana+kanji vertical)
-  - tesseract (binary external, fallback cho Latin in ấn rõ)
 
 Khi user chỉ định `--ocr-engine auto`:
   Router map từ language code → preferred engine:
       ja  → manga-ocr (nếu có) > easyocr ja
       ko  → easyocr ko
       zh  → paddleocr ch > easyocr ch_sim/ch_tra
-      en  → paddleocr en > easyocr en > tesseract eng
+      en  → paddleocr en > easyocr en
       vi  → paddleocr en (latin script) > easyocr vi
       mixed/unknown → easyocr với lang combo
   Mỗi block: chạy primary → nếu confidence < threshold → retry với preprocessing
   upscale/denoise/sharpen → nếu vẫn fail → secondary engine fallback.
 
-Lazy import: từng engine chỉ load khi cần. Không có dep cứng vào paddleocr/manga-ocr/tesseract.
+Lazy import: từng engine chỉ load khi cần. Không có dep cứng vào paddleocr/manga-ocr.
 """
 from __future__ import annotations
 
@@ -86,15 +85,13 @@ def _clean_ocr_artifacts(text: str) -> str:
 class OCRRouterConfig:
     """Cấu hình router. Bổ sung cho OCRConfig hiện có."""
 
-    # 'auto' | 'paddleocr' | 'easyocr' | 'manga_ocr' | 'tesseract' | 'paddleocr_vl' | 'mit_48px'
-    engine: str = "auto"
+    # 'auto' | 'paddleocr' | 'easyocr' | 'manga_ocr' | 'paddleocr_vl' | 'mit_48px'
+    engine: str = "paddleocr"
     use_paddleocr_for_latin: bool = True   # paddleocr primary cho en/vi/zh
     use_manga_ocr_for_ja: bool = True
-    use_tesseract_for_en: bool = False
     confidence_floor: float = 0.50   # < floor → retry preprocessing
     confidence_secondary: float = 0.30  # < secondary → switch engine
     max_retries: int = 2
-    tesseract_cmd: Optional[str] = None  # path tới tesseract.exe nếu cần
     paddleocr_disable_mkldnn: bool = True  # tránh PIR/oneDNN crash trên Windows
     preprocess_variants: tuple[str, ...] = field(
         default_factory=lambda: ("default", "upscale2x", "denoise+sharpen",
@@ -262,40 +259,6 @@ class _EngineMIT48px:
         return "", 0.0
 
 
-class _EngineTesseract:
-    """Wrap pytesseract. Hữu ích cho Latin in ấn rõ."""
-
-    def __init__(self, tesseract_cmd: Optional[str] = None):
-        self._cmd = tesseract_cmd
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        try:
-            import pytesseract
-        except ImportError as e:
-            raise RuntimeError("Cần cài pytesseract") from e
-        if self._cmd:
-            pytesseract.pytesseract.tesseract_cmd = self._cmd
-
-        # Map EasyOCR lang codes → tesseract lang codes
-        tess_map = {"en": "eng", "ja": "jpn", "ko": "kor",
-                    "ch_sim": "chi_sim", "ch_tra": "chi_tra", "vi": "vie"}
-        tess_langs = "+".join(tess_map.get(l, "eng") for l in langs)
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-        try:
-            data = pytesseract.image_to_data(gray, lang=tess_langs,
-                                             output_type=pytesseract.Output.DICT)
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"Tesseract fail: {e}") from e
-
-        words = [w for w in data["text"] if w.strip()]
-        confs = [int(c) for c, w in zip(data["conf"], data["text"])
-                 if w.strip() and str(c).lstrip("-").isdigit() and int(c) >= 0]
-        text = " ".join(words)
-        conf = (sum(confs) / len(confs) / 100.0) if confs else 0.0
-        return text, conf
-
-
 # --------------------------- Preprocessing variants --------------------------- #
 
 def _variant_default(crop: np.ndarray) -> np.ndarray:
@@ -372,11 +335,9 @@ class OCRRouter:
         self._log = get_logger()
         self._paddleocr: Optional[_EnginePaddleOCR] = None
         self._paddleocr_vl: Optional[_EnginePaddleOCRVL] = None
-        self._tesseract: Optional[_EngineTesseract] = None
         self._mit_48px: Optional[_EngineMIT48px] = None
-        # Track engine availability — đánh dấu False sau lần đầu fail load
-        self._available = {"paddleocr": None, "tesseract": None,
-                           "paddleocr_vl": None, "mit_48px": None}
+
+        self._available = {"paddleocr": None, "paddleocr_vl": None, "mit_48px": None}
 
     # --------------------------- Public --------------------------- #
 
@@ -447,7 +408,6 @@ class OCRRouter:
     def release(self) -> None:
         self._paddleocr = None
         self._paddleocr_vl = None
-        self._tesseract = None
         self._mit_48px = None
 
     # --------------------------- Internals --------------------------- #
@@ -457,14 +417,14 @@ class OCRRouter:
         """Return (primary, secondary) engine names."""
         cfg = self.router_cfg
         if cfg.engine != "auto":
-            return cfg.engine, "tesseract" if cfg.engine != "tesseract" else None
+            return cfg.engine, None
 
         # PaddleOCR là engine chính cho MỌI ngôn ngữ (nhanh + chính xác)
         if self._is_available("paddleocr"):
-            return "paddleocr", "tesseract" if self._is_available("tesseract") else None
+            return "paddleocr", None
 
-        # Fallback: tesseract
-        return "tesseract", None
+        # Không có fallback nếu không có tesseract/easyocr
+        return "paddleocr", None
 
     def _is_available(self, engine: str) -> bool:
         if self._available[engine] is not None:
@@ -472,8 +432,6 @@ class OCRRouter:
         try:
             if engine in ("paddleocr", "paddleocr_vl"):
                 __import__("paddleocr")
-            elif engine == "tesseract":
-                __import__("pytesseract")
             elif engine == "mit_48px":
                 pass # check logic cho mit_48px package
             self._available[engine] = True
@@ -498,10 +456,6 @@ class OCRRouter:
                     self._paddleocr_vl = _EnginePaddleOCRVL()
                 return self._paddleocr_vl.read(crop, langs)
 
-            if name == "tesseract":
-                if self._tesseract is None:
-                    self._tesseract = _EngineTesseract(self.router_cfg.tesseract_cmd)
-                return self._tesseract.read(crop, langs)
             if name == "mit_48px":
                 if self._mit_48px is None:
                     self._mit_48px = _EngineMIT48px()
