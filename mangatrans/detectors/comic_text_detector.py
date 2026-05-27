@@ -32,7 +32,8 @@ class ComicTextDetector(BaseTextDetector):
             providers = [p for p in preferred if p in available]
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            so.intra_op_num_threads = self.config.intra_op_threads
+            so.intra_op_num_threads = 1
+            so.inter_op_num_threads = 1
             so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             self._session = ort.InferenceSession(
                 self.config.model_path, sess_options=so, providers=providers,
