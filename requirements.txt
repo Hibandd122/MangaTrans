@@ -1,0 +1,54 @@
+# MangaTrans — full manga translation pipeline dependencies
+# Self-contained: cài file này (+ Python 3.10+) là đủ chạy MangaTrans/manga/.
+#
+# Yêu cầu hệ thống ngoài Python:
+#   - Tesseract binary (cho pytesseract):
+#     Windows: https://github.com/UB-Mannheim/tesseract/wiki
+#     Linux:   apt install tesseract-ocr
+#   - GPU driver phù hợp với bản torch/onnxruntime đã chọn.
+#
+# Asset model (giữ ở MangaTrans/ root):
+#   - anime-manga-big-lama.pt        (196MB, LaMa inpainter, cần torch)
+#   - comic-text-detector.onnx       (90MB, bubble detector, cần onnxruntime)
+#   - Mali-Bold.ttf                  (font render text dịch)
+
+# -------------------- Imaging --------------------
+Pillow==12.2.0
+opencv-python==4.13.0.92
+numpy==2.2.6
+
+# -------------------- HTTP (OpenRouter) --------------------
+requests==2.34.2
+
+# -------------------- PyTorch (cho LaMa inpainter) --------------------
+# CPU-only (mặc định):
+torch==2.5.1
+torchvision==0.20.1
+# GPU CUDA 12.1 — cài tách qua index của PyTorch:
+#   pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 \
+#       --index-url https://download.pytorch.org/whl/cu121
+
+# -------------------- ONNX runtime (cho text detector) --------------------
+# Windows DirectML (GPU):
+onnxruntime-directml==1.23.0
+# CPU thay thế:   onnxruntime==1.23.0
+# CUDA Linux/Win: onnxruntime-gpu==1.23.0
+
+# -------------------- OCR engines --------------------
+paddleocr==3.5.0
+paddlepaddle==3.3.1
+easyocr==1.7.2
+manga-ocr==0.1.14
+pytesseract==0.3.13
+
+# -------------------- Koharu Integration --------------------
+# Local LLM
+llama-cpp-python==0.2.77
+huggingface-hub==0.23.2
+# Modern Inpainting (FLUX.2)
+diffusers==0.29.2
+transformers==4.42.0
+accelerate==0.32.0
+
+# -------------------- UI --------------------
+gradio>=4.0.0

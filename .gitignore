@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Models
+*.pt
+*.onnx
+*.ckpt
+*.safetensors
+models/
+
+# Temp files
+*.log
+*.tmp
+debug/
+out_test/
