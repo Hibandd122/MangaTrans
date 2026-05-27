@@ -1,4 +1,7 @@
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["LD_LIBRARY_PATH"] = "/usr/local/lib/python3.12/dist-packages/nvidia/cudnn/lib:" + os.environ.get("LD_LIBRARY_PATH", "")
 import json
 import tempfile
 import zipfile
