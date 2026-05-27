@@ -148,7 +148,23 @@ def _http_post_json(url: str, headers: dict, payload: dict,
                 )
                 time.sleep(delay)
                 continue
+            if e.code in (502, 503, 504) and attempt < max_retries - 1:
+                log.warning(
+                    f"   [{label}] API báo lỗi {e.code} (Gateway/Timeout), đợi 5s rồi thử lại "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(5)
+                continue
             raise RuntimeError(f"{label} API HTTP {e.code}: {err_body[:500]}")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_retries - 1:
+                log.warning(
+                    f"   [{label}] Lỗi mạng/Timeout ({e}), đợi 5s rồi thử lại "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(5)
+                continue
+            raise RuntimeError(f"{label} API lỗi mạng: {e}")
     raise RuntimeError(f"{label} API không phản hồi sau khi retry.")
 
 
