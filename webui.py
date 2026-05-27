@@ -195,4 +195,4 @@ with gr.Blocks(title="MangaTrans Web UI") as app:
             archive_btn.click(fn=process_archive, inputs=[archive_input], outputs=[archive_output, archive_log])
 
 if __name__ == "__main__":
-    app.launch(server_name="0.0.0.0", server_port=7860, share=True)
+    app.queue().launch(server_name="0.0.0.0", server_port=7860, share=True)
