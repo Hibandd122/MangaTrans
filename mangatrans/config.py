@@ -67,8 +67,11 @@ QUY TẮC DỊCH:
 # Font duy nhất — Mali-Bold.ttf (handwritten bold, full Vietnamese coverage)
 # ở repo root. BadComic.ttf cũ thiếu dấu VN (chỉ ~50% coverage) → render ra
 # tofu boxes. Mali-Bold có 100% Latin Extended Additional.
+import os
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 DEFAULT_FONT_CANDIDATES: tuple[str, ...] = (
-    r"D:\Anime\Web\MangaTrans\Mali-Bold.ttf",
+    os.path.join(_BASE_DIR, "Mali-Bold.ttf"),
 )
 
 

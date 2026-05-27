@@ -63,8 +63,11 @@ INPAINT_CANDIDATES: tuple[tuple[str, str], ...] = (
 
 # Font default — Mali-Bold.ttf (handwritten bold, full Vietnamese coverage).
 # Asset giữ ở MangaTrans/ cũ (per user preference 2026-05-25).
+import os
+_BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 DEFAULT_FONT_CANDIDATES: tuple[str, ...] = (
-    r"D:\Anime\Web\MangaTrans\Mali-Bold.ttf",
+    os.path.join(_BASE_DIR, "Mali-Bold.ttf"),
 )
 
 
