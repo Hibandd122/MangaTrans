@@ -433,8 +433,10 @@ class OCRRouter:
     # --------------------------- Public --------------------------- #
 
     def run_blocks(self, image: np.ndarray, blocks: list[dict],
-                   detection: LanguageDetection) -> list[dict]:
+                   detection: Optional[LanguageDetection] = None) -> list[dict]:
         """OCR mỗi block. Trả list dict tương thích pipeline cũ (key 'text','ocr_conf')."""
+        if detection is None:
+            detection = LanguageDetection(code="ja", confidence=1.0, langs=("ja", "en"))
         results: list[dict] = []
         pad = self.ocr_cfg.crop_pad
         h, w = image.shape[:2]
