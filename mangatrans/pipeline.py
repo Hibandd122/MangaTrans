@@ -92,6 +92,7 @@ class MangaPipeline:
             self.translator, self.config.translation_pipeline,
         )
         self._page_counter = 0
+        self.raise_translation_errors = False  # legacy mode: swallow errors
 
         # Render: TypographyEngine (4-tier shape-aware fit)
         self._typo_engine = TypographyEngine(
