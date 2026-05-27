@@ -26,11 +26,6 @@ requests==2.34.2
 torch==2.5.1+cu121
 torchvision==0.20.1+cu121
 
-# -------------------- ONNX runtime (cho text detector) --------------------
-# Tạm thời tắt directml để không bị lỗi trên Colab (Linux).
-# Nếu chạy ở máy cá nhân Windows thì bỏ dấu # ở dòng dưới:
-# onnxruntime-directml==1.23.0
-
 # -------------------- OCR engines --------------------
 paddleocr==3.5.0
 paddlepaddle==3.3.1
