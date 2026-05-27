@@ -13,12 +13,12 @@
 #   - Mali-Bold.ttf                  (font render text dịch)
 
 # -------------------- Imaging --------------------
-Pillow==12.2.0
+Pillow
 opencv-python
 numpy<2.0.0
 
 # -------------------- HTTP (OpenRouter) --------------------
-requests==2.34.2
+requests
 
 # -------------------- PyTorch (cho LaMa inpainter) --------------------
 # GPU CUDA 12.1:
