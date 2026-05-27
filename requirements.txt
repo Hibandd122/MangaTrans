@@ -41,14 +41,7 @@ easyocr==1.7.2
 manga-ocr==0.1.14
 pytesseract==0.3.13
 
-# -------------------- Koharu Integration --------------------
-# Local LLM
-llama-cpp-python==0.2.77
-huggingface-hub==0.23.2
-# Modern Inpainting (FLUX.2)
-diffusers==0.29.2
-transformers==4.42.0
-accelerate==0.32.0
 
 # -------------------- UI --------------------
 gradio>=4.0.0
+patool==2.2.0
