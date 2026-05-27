@@ -513,26 +513,11 @@ class OCRRouter:
         if cfg.engine != "auto":
             return cfg.engine, "easyocr" if cfg.engine != "easyocr" else None
 
-        code = detection.code
-        # Japanese: manga-ocr > paddleocr japan > easyocr
-        if code == "ja" and cfg.use_manga_ocr_for_ja and self._is_available("manga_ocr"):
-            return "manga_ocr", "easyocr"
-        # Latin (en/vi) or zh: paddleocr primary nếu available
-        if code in ("en", "vi", "zh") and cfg.use_paddleocr_for_latin \
-                and self._is_available("paddleocr"):
-            return "paddleocr", "easyocr"
-        if code == "en" and cfg.use_tesseract_for_en and self._is_available("tesseract"):
-            return "tesseract", "easyocr"
-        
-        # Override bằng paddleocr_vl nếu backend được set explicit
-        if cfg.engine == "paddleocr_vl" and self._is_available("paddleocr_vl"):
-            return "paddleocr_vl", "easyocr"
-        if cfg.engine == "mit_48px" and self._is_available("mit_48px"):
-            return "mit_48px", "easyocr"
-
-        # Mọi case khác: easyocr primary, paddleocr secondary nếu available
+        # PaddleOCR là engine chính cho MỌI ngôn ngữ (nhanh + chính xác)
         if self._is_available("paddleocr"):
-            return "easyocr", "paddleocr"
+            return "paddleocr", "easyocr"
+
+        # Fallback: easyocr nếu paddleocr không có
         secondary = "tesseract" if self._is_available("tesseract") else None
         return "easyocr", secondary
 
