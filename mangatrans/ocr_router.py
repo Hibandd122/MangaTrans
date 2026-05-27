@@ -115,34 +115,6 @@ class OCRResult:
 
 # --------------------------- Engine adapters --------------------------- #
 
-class _EngineEasyOCR:
-    """Wrap EasyOCR. Reuse reader instance cho từng lang combo."""
-
-    def __init__(self, gpu: bool = True):
-        self._readers: dict[tuple[str, ...], object] = {}
-        self.gpu = gpu
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        try:
-            import easyocr
-        except ImportError as e:
-            raise RuntimeError("Cần cài easyocr") from e
-        if langs not in self._readers:
-            self._readers[langs] = easyocr.Reader(list(langs),
-                                                  gpu=self.gpu, verbose=False)
-        reader = self._readers[langs]
-        results = reader.readtext(image, detail=1, paragraph=False)
-        if not results:
-            return "", 0.0
-        results.sort(key=lambda r: (
-            float(np.mean([p[1] for p in r[0]])),
-            float(np.mean([p[0] for p in r[0]])),
-        ))
-        text = " ".join(r[1].strip() for r in results if r[1].strip())
-        conf = float(np.mean([r[2] for r in results]))
-        return text, conf
-
-
 class _EnginePaddleOCR:
     """Wrap PaddleOCR (PP-OCRv5). Reuse predictor per lang.
 
@@ -269,28 +241,7 @@ class _EnginePaddleOCRVL:
         return " ".join(texts), float(np.mean(scores))
 
 
-class _EngineMangaOCR:
-    """Wrap manga-ocr. Chuyên Nhật, accuracy cao trên kana + kanji + vertical."""
 
-    def __init__(self):
-        self._reader = None
-
-    def _ensure(self):
-        if self._reader is None:
-            from manga_ocr import MangaOcr
-            self._reader = MangaOcr()
-        return self._reader
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        del langs  # always Japanese
-        from PIL import Image
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
-        pil = Image.fromarray(rgb)
-        text = self._ensure()(pil)
-        # manga-ocr không trả conf — ước lượng theo length / không-empty
-        text = (text or "").strip()
-        conf = 0.85 if text else 0.0
-        return text, conf
 
 
 class _EngineMIT48px:
@@ -421,13 +372,10 @@ class OCRRouter:
         self._log = get_logger()
         self._paddleocr: Optional[_EnginePaddleOCR] = None
         self._paddleocr_vl: Optional[_EnginePaddleOCRVL] = None
-        self._easyocr: Optional[_EngineEasyOCR] = None
-        self._manga_ocr: Optional[_EngineMangaOCR] = None
         self._tesseract: Optional[_EngineTesseract] = None
         self._mit_48px: Optional[_EngineMIT48px] = None
         # Track engine availability — đánh dấu False sau lần đầu fail load
-        self._available = {"paddleocr": None, "easyocr": None,
-                           "manga_ocr": None, "tesseract": None,
+        self._available = {"paddleocr": None, "tesseract": None,
                            "paddleocr_vl": None, "mit_48px": None}
 
     # --------------------------- Public --------------------------- #
@@ -499,8 +447,6 @@ class OCRRouter:
     def release(self) -> None:
         self._paddleocr = None
         self._paddleocr_vl = None
-        self._easyocr = None
-        self._manga_ocr = None
         self._tesseract = None
         self._mit_48px = None
 
@@ -511,15 +457,14 @@ class OCRRouter:
         """Return (primary, secondary) engine names."""
         cfg = self.router_cfg
         if cfg.engine != "auto":
-            return cfg.engine, "easyocr" if cfg.engine != "easyocr" else None
+            return cfg.engine, "tesseract" if cfg.engine != "tesseract" else None
 
         # PaddleOCR là engine chính cho MỌI ngôn ngữ (nhanh + chính xác)
         if self._is_available("paddleocr"):
-            return "paddleocr", "easyocr"
+            return "paddleocr", "tesseract" if self._is_available("tesseract") else None
 
-        # Fallback: easyocr nếu paddleocr không có
-        secondary = "tesseract" if self._is_available("tesseract") else None
-        return "easyocr", secondary
+        # Fallback: tesseract
+        return "tesseract", None
 
     def _is_available(self, engine: str) -> bool:
         if self._available[engine] is not None:
@@ -527,12 +472,8 @@ class OCRRouter:
         try:
             if engine in ("paddleocr", "paddleocr_vl"):
                 __import__("paddleocr")
-            elif engine == "manga_ocr":
-                __import__("manga_ocr")
             elif engine == "tesseract":
                 __import__("pytesseract")
-            elif engine == "easyocr":
-                __import__("easyocr")
             elif engine == "mit_48px":
                 pass # check logic cho mit_48px package
             self._available[engine] = True
@@ -556,14 +497,7 @@ class OCRRouter:
                 if self._paddleocr_vl is None:
                     self._paddleocr_vl = _EnginePaddleOCRVL()
                 return self._paddleocr_vl.read(crop, langs)
-            if name == "easyocr":
-                if self._easyocr is None:
-                    self._easyocr = _EngineEasyOCR(gpu=self.ocr_cfg.gpu)
-                return self._easyocr.read(crop, langs)
-            if name == "manga_ocr":
-                if self._manga_ocr is None:
-                    self._manga_ocr = _EngineMangaOCR()
-                return self._manga_ocr.read(crop, langs)
+
             if name == "tesseract":
                 if self._tesseract is None:
                     self._tesseract = _EngineTesseract(self.router_cfg.tesseract_cmd)

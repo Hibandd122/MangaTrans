@@ -230,21 +230,33 @@ class LanguageDetector:
         Trả (scores_per_code, glyph_counts_across_all, mixed_flag).
         """
         try:
-            import easyocr
+            from paddleocr import PaddleOCR
         except ImportError as e:
-            raise RuntimeError("Cần cài easyocr") from e
+            raise RuntimeError("Cần cài paddleocr") from e
 
         scores: dict[str, float] = {}
         glyph_counts: dict[str, int] = {k: 0 for k in SCRIPT_RANGES}
         cand_text_glyph: dict[str, dict[str, int]] = {}
         enabled = set(self.config.enabled_candidates)
 
+        paddle_lang_map = {
+            "ja": "japan",
+            "ko": "korean",
+            "zh_sim": "ch",
+            "zh_tra": "chinese_cht",
+            "en": "en",
+            "vi": "latin",
+        }
+
         for cand in LANG_CANDIDATES:
             if cand["code"] not in enabled:
                 continue
+            plang = paddle_lang_map.get(cand["code"])
+            if not plang:
+                continue
+
             try:
-                reader = easyocr.Reader(list(cand["langs"]),
-                                        gpu=True, verbose=False)
+                reader = PaddleOCR(use_angle_cls=True, lang=plang, show_log=False)
             except Exception as e:  # noqa: BLE001
                 self._log.debug(f"   [LangDetect] init {cand['name']} fail: {e}")
                 continue
@@ -254,14 +266,16 @@ class LanguageDetector:
             cjk_punct_hits = 0
             for crop in crops:
                 try:
-                    res = reader.readtext(crop, detail=1, paragraph=False)
+                    res = reader.ocr(crop, cls=True)
                 except Exception:  # noqa: BLE001
                     continue
-                if not res:
+                if not res or not res[0]:
                     continue
-                confs.append(sum(r[2] for r in res) / len(res))
-                for r in res:
-                    text = r[1]
+                
+                lines = res[0]
+                confs.append(sum(r[1][1] for r in lines) / len(lines))
+                for r in lines:
+                    text = r[1][0]
                     for ch in text:
                         if ch in CJK_PUNCT:
                             cjk_punct_hits += 1
