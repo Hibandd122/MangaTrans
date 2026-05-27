@@ -35,8 +35,10 @@ from .cleaner import clean_bubbles_by_fill, dilate_mask, smart_fill_uniform_regi
 from .config import PipelineConfig
 from .geometry import InteriorCache
 from .inpainter import BaseInpainter
+from .language_detector import LanguageDetector
 from .ocr_router import OCRRouter
 from .redraw_engine import RedrawEngine
+from .sfx_detector import SFXDetector, SFXProfile
 from .translate import Translator
 from .translation_pipeline import TranslationPipeline
 from .typography_engine import TypographyEngine
@@ -84,6 +86,17 @@ class MangaPipeline:
 
         # OCR Router (PaddleOCR primary, EasyOCR fallback, manga-ocr cho ja)
         self.ocr_router = OCRRouter(self.config.ocr, self.config.ocr_router)
+
+        self.language_detector = (
+            LanguageDetector(self.config.language_detector)
+            if self.config.use_language_detector
+            else None
+        )
+        self.sfx_detector = (
+            SFXDetector(self.config.sfx_detector)
+            if self.config.use_sfx_detector
+            else None
+        )
 
         # Translation: Translator (HTTP layer) + TranslationPipeline (role-aware)
         from .llm_backend import create_llm_backend
@@ -134,7 +147,9 @@ class MangaPipeline:
         ctx = self.new_context()
         ctx = self.stage_load(ctx, input_path)
         ctx = self.stage_detect(ctx)
+        ctx = self.stage_lang_detect(ctx)
         ctx = self.stage_ocr(ctx)
+        ctx = self.stage_sfx(ctx)
         ctx = self.stage_translate(ctx, output_path)
         ctx = self.stage_save_json(ctx, output_path)
         ctx = self.stage_preserve_clean(ctx)
@@ -154,10 +169,13 @@ class MangaPipeline:
         # --- Stage CPU/IO: load ảnh (không cần GPU) ---
         ctx = self.stage_load(ctx, input_path)
 
-        # --- GPU block 1: detect + OCR ---
+        # --- GPU block 1: detect + language preview + OCR ---
         with self._gpu_lock:
             ctx = self.stage_detect(ctx)
+            ctx = self.stage_lang_detect(ctx)
             ctx = self.stage_ocr(ctx)
+
+        ctx = self.stage_sfx(ctx)
 
         # --- CPU/IO: translate (HTTP API call — chờ network, không cần GPU) ---
         ctx = self.stage_translate(ctx, output_path)
@@ -204,14 +222,65 @@ class MangaPipeline:
         self._log.info(f"   - Tìm thấy {len(det_res.blocks)} bubble")
         return ctx
 
+    def stage_lang_detect(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect page language before OCR. Stage GPU/CPU depending on OCR backend."""
+        ctx["detection"] = None
+        if self.language_detector is not None and ctx["blocks"]:
+            ctx["detection"] = self.language_detector.detect(
+                ctx["image"], ctx["blocks"]
+            )
+        return ctx
+
     def stage_ocr(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
         """OCR via Router. Stage GPU (Paddle/EasyOCR/manga-ocr)."""
         ocr_results: list[dict] = []
         blocks = ctx["blocks"]
         if blocks:
-            self._log.info(f"📝 OCR via Router (engine={self.config.ocr_router.engine})...")
-            ocr_results = self.ocr_router.run_blocks(ctx["image"], blocks, None)
+            detection = ctx.get("detection")
+            if detection is not None:
+                self._log.info(
+                    f"📝 OCR via Router (lang={detection.code}, "
+                    f"engine={self.config.ocr_router.engine})..."
+                )
+            else:
+                self._log.info(
+                    f"📝 OCR via Router (engine={self.config.ocr_router.engine})..."
+                )
+            ocr_results = self.ocr_router.run_blocks(
+                ctx["image"], blocks, detection
+            )
         ctx["ocr_results"] = ocr_results
+        return ctx
+
+    def stage_sfx(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Classify OCR blocks as dialogue, narration, or SFX."""
+        blocks = ctx["blocks"]
+        ocr_results = ctx["ocr_results"]
+        sfx_profiles: list[Optional[SFXProfile]] = [None] * len(blocks)
+        if self.sfx_detector is not None and ocr_results:
+            by_idx = {r["block_idx"]: r for r in ocr_results}
+            page_h, page_w = ctx["h"], ctx["w"]
+            for i, blk in enumerate(blocks):
+                ocr_rec = by_idx.get(i, {})
+                prof = self.sfx_detector.classify(
+                    blk,
+                    ocr_rec.get("text", ""),
+                    page_w,
+                    page_h,
+                    ocr_conf=ocr_rec.get("ocr_conf"),
+                )
+                sfx_profiles[i] = prof
+            for r in ocr_results:
+                idx = r.get("block_idx")
+                if not isinstance(idx, int) or idx < 0 or idx >= len(sfx_profiles):
+                    continue
+                p = sfx_profiles[idx]
+                if p is not None:
+                    r["role"] = p.role
+                    r["sfx_subtype"] = p.subtype
+                    r["should_translate"] = p.should_translate
+                    r["should_preserve_pixels"] = p.should_preserve_pixels
+        ctx["sfx_profiles"] = sfx_profiles
         return ctx
 
     def stage_translate(self, ctx: Dict[str, Any], output_path: str) -> Dict[str, Any]:

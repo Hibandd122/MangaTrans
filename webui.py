@@ -6,7 +6,6 @@ import json
 import tempfile
 import zipfile
 import shutil
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gradio as gr
 from PIL import Image
@@ -30,7 +29,34 @@ pipeline = MangaPipeline(cfg, base_dir=".")
 
 # Số luồng song song cho batch (GPU sẽ được bảo vệ bởi pipeline._gpu_lock)
 MAX_WORKERS = 3
-_page_counter_lock = threading.Lock()
+
+
+def _file_path(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return value.get("path") or value.get("name")
+    return getattr(value, "name", str(value))
+
+
+def _safe_extract_zip(zip_ref: zipfile.ZipFile, dest_dir: str) -> None:
+    dest_real = os.path.normcase(os.path.realpath(dest_dir))
+    for member in zip_ref.infolist():
+        target = os.path.normcase(
+            os.path.realpath(os.path.join(dest_dir, member.filename))
+        )
+        try:
+            common_path = os.path.commonpath([dest_real, target])
+        except ValueError as exc:
+            raise ValueError(
+                f"Archive contains unsafe path: {member.filename}"
+            ) from exc
+        if common_path != dest_real:
+            raise ValueError(f"Archive contains unsafe path: {member.filename}")
+    zip_ref.extractall(dest_dir)
+
 
 def run_translation(image: Image.Image):
     if image is None: return None, "No image provided."
@@ -45,7 +71,8 @@ def run_translation(image: Image.Image):
     
     try:
         pipeline.process_image(input_path, output_path)
-        output_image = Image.open(output_path)
+        with Image.open(output_path) as img:
+            output_image = img.copy()
         
         json_data = "No translation data found."
         if os.path.exists(json_path):
@@ -56,9 +83,12 @@ def run_translation(image: Image.Image):
     except Exception as e:
         import traceback
         return None, f"Error:\n{str(e)}\n\n{traceback.format_exc()}"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 def process_multiple_images(file_paths, progress=gr.Progress()):
     if not file_paths: return None, "Vui lòng tải lên ít nhất 1 ảnh."
+    file_paths = [p for p in (_file_path(f) for f in file_paths) if p]
     
     temp_dir = tempfile.mkdtemp()
     output_dir = os.path.join(temp_dir, "translated")
@@ -102,6 +132,7 @@ def process_multiple_images(file_paths, progress=gr.Progress()):
 
 def process_archive(archive_path, progress=gr.Progress()):
     if not archive_path: return None, "Vui lòng tải lên file nén."
+    archive_path = _file_path(archive_path)
     
     if not os.path.exists(archive_path): return None, "File không tồn tại."
     
@@ -118,7 +149,7 @@ def process_archive(archive_path, progress=gr.Progress()):
         # Giải nén
         if is_zip:
             with zipfile.ZipFile(archive_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
+                _safe_extract_zip(zip_ref, extract_dir)
         else:
             try:
                 import patoolib

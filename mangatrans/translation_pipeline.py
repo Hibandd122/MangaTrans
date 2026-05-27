@@ -154,7 +154,7 @@ class TranslationPipeline:
 
         # Speaker continuity hint: y-band cluster + side
         speaker_hints = self._derive_speaker_hints(
-            [ocr_results[i] for i in ordered_global_idx], page_h,
+            [ocr_results[i] for i in ordered_global_idx], page_w, page_h,
         )
 
         # Mở rộng prompt nếu role-aware
@@ -185,7 +185,7 @@ class TranslationPipeline:
     # --------------------------- Internals --------------------------- #
 
     def _derive_speaker_hints(self, ordered_results: list[dict],
-                              page_h: int) -> list[str]:
+                              page_w: int, page_h: int) -> list[str]:
         """Cluster bubble theo y-band → assume cùng cluster là cùng cuộc thoại."""
         if not ordered_results:
             return []
@@ -202,7 +202,7 @@ class TranslationPipeline:
             prev_band = band
             # side hint từ position
             cx = (x1 + x2) // 2
-            side = "right" if cx > (r.get("_page_w", 9999) // 2) else "left"
+            side = "right" if cx > (page_w // 2) else "left"
             hints.append(f"turn{cluster_id}-{side}")
         return hints
 

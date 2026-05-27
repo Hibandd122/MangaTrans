@@ -264,6 +264,7 @@ class PipelineConfig:
     local_llm: LocalLLMConfig = field(default_factory=LocalLLMConfig)
 
     # Sub-configs cho VIP modules — lazy default trong __post_init__.
+    language_detector: object = field(default=None)
     ocr_router: object = field(default=None)
     sfx_detector: object = field(default=None)
     redraw_engine: object = field(default=None)
@@ -272,10 +273,14 @@ class PipelineConfig:
     # Top-level
     log_level: str = "INFO"
     preserve_untranslated_cjk: bool = True   # giữ nguyên CJK SFX khi không dịch được
+    use_language_detector: bool = True
     use_sfx_detector: bool = True            # SFX role classification
 
     def __post_init__(self) -> None:
         # Defer import để tránh vòng lặp config ↔ ocr_router.
+        if self.language_detector is None:
+            from .language_detector import LanguageDetectorConfig
+            self.language_detector = LanguageDetectorConfig()
         if self.ocr_router is None:
             from .ocr_router import OCRRouterConfig
             self.ocr_router = OCRRouterConfig()
