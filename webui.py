@@ -6,6 +6,8 @@ import json
 import tempfile
 import zipfile
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import gradio as gr
 from PIL import Image
 
@@ -25,6 +27,10 @@ cfg = PipelineConfig(
     ocr_router=OCRRouterConfig()
 )
 pipeline = MangaPipeline(cfg, base_dir=".")
+
+# Số luồng song song cho batch (GPU sẽ được bảo vệ bởi pipeline._gpu_lock)
+MAX_WORKERS = 3
+_page_counter_lock = threading.Lock()
 
 def run_translation(image: Image.Image):
     if image is None: return None, "No image provided."
@@ -68,22 +74,27 @@ def process_multiple_images(file_paths, progress=gr.Progress()):
         # Sắp xếp file theo tên
         image_files.sort(key=lambda x: os.path.basename(x))
         
-        for i, img_path in enumerate(progress.tqdm(image_files, desc="Đang dịch nhiều ảnh...")):
+        total = len(image_files)
+        
+        def _process_one(img_path):
             filename = os.path.basename(img_path)
             out_img_path = os.path.join(output_dir, filename)
-            
             try:
-                pipeline.process_image(img_path, out_img_path)
+                pipeline.process_image_threadsafe(img_path, out_img_path)
             except Exception as e:
-                # Fallback: copy ảnh gốc nếu dịch lỗi
                 shutil.copy2(img_path, out_img_path)
                 print(f"Lỗi khi dịch {img_path}: {e}")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_process_one, p): p for p in image_files}
+            for fut in progress.tqdm(as_completed(futures), total=total, desc=f"Đang dịch ({MAX_WORKERS} luồng)..."):
+                fut.result()  # propagate any unhandled exception
                 
         # Nén thư mục kết quả thành file zip
         result_zip = os.path.join(temp_dir, "translated_images.zip")
         shutil.make_archive(result_zip.replace('.zip', ''), 'zip', output_dir)
         
-        return result_zip, f"Thành công! Đã dịch {len(image_files)} ảnh."
+        return result_zip, f"Thành công! Đã dịch {len(image_files)} ảnh ({MAX_WORKERS} luồng song song)."
         
     except Exception as e:
         import traceback
@@ -131,24 +142,29 @@ def process_archive(archive_path, progress=gr.Progress()):
         # Sắp xếp file theo tên (ví dụ: 001.jpg, 002.jpg)
         image_files.sort()
         
-        # Dịch từng ảnh
-        for i, img_path in enumerate(progress.tqdm(image_files, desc="Đang dịch file nén...")):
+        # Dịch song song bằng ThreadPoolExecutor
+        total = len(image_files)
+        
+        def _process_one(img_path):
             rel_path = os.path.relpath(img_path, extract_dir)
             out_img_path = os.path.join(output_dir, rel_path)
             os.makedirs(os.path.dirname(out_img_path), exist_ok=True)
-            
             try:
-                pipeline.process_image(img_path, out_img_path)
+                pipeline.process_image_threadsafe(img_path, out_img_path)
             except Exception as e:
-                # Fallback: copy ảnh gốc nếu dịch lỗi
                 shutil.copy2(img_path, out_img_path)
                 print(f"Lỗi khi dịch {img_path}: {e}")
+        
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(_process_one, p): p for p in image_files}
+            for fut in progress.tqdm(as_completed(futures), total=total, desc=f"Đang dịch ({MAX_WORKERS} luồng)..."):
+                fut.result()
                 
         # Nén thư mục kết quả thành file zip
         result_zip = os.path.join(temp_dir, f"translated_{os.path.splitext(filename)[0]}.zip")
         shutil.make_archive(result_zip.replace('.zip', ''), 'zip', output_dir)
         
-        return result_zip, f"Thành công! Đã dịch {len(image_files)} ảnh."
+        return result_zip, f"Thành công! Đã dịch {len(image_files)} ảnh ({MAX_WORKERS} luồng song song)."
         
     except Exception as e:
         import traceback

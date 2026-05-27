@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from typing import Any, Dict, Optional, Sequence
 
 import cv2
@@ -93,6 +94,7 @@ class MangaPipeline:
         )
         self._page_counter = 0
         self.raise_translation_errors = False  # legacy mode: swallow errors
+        self._gpu_lock = threading.Lock()  # GPU mutex cho multithreaded batch
 
         # Render: TypographyEngine (4-tier shape-aware fit)
         self._typo_engine = TypographyEngine(
@@ -139,6 +141,37 @@ class MangaPipeline:
         ctx = self.stage_inpaint(ctx)
         ctx = self.stage_render(ctx)
         ctx = self.stage_save_png(ctx, output_path)
+        summary = ctx["summary"]
+        summary["input"] = input_path
+        summary["output"] = output_path
+        return summary
+
+    def process_image_threadsafe(self, input_path: str, output_path: str) -> dict:
+        """Thread-safe version: acquire GPU lock cho GPU stages,
+        release khi chạy CPU/IO (translate API, save) để luồng khác dùng GPU."""
+        ctx = self.new_context()
+
+        # --- Stage CPU/IO: load ảnh (không cần GPU) ---
+        ctx = self.stage_load(ctx, input_path)
+
+        # --- GPU block 1: detect + OCR ---
+        with self._gpu_lock:
+            ctx = self.stage_detect(ctx)
+            ctx = self.stage_ocr(ctx)
+
+        # --- CPU/IO: translate (HTTP API call — chờ network, không cần GPU) ---
+        ctx = self.stage_translate(ctx, output_path)
+        ctx = self.stage_save_json(ctx, output_path)
+
+        # --- GPU block 2: preserve_clean + inpaint + render ---
+        with self._gpu_lock:
+            ctx = self.stage_preserve_clean(ctx)
+            ctx = self.stage_inpaint(ctx)
+            ctx = self.stage_render(ctx)
+
+        # --- CPU/IO: save result PNG ---
+        ctx = self.stage_save_png(ctx, output_path)
+
         summary = ctx["summary"]
         summary["input"] = input_path
         summary["output"] = output_path
@@ -364,7 +397,8 @@ class MangaPipeline:
         untranslated_bboxes: list[Sequence[int]] = []
         preserved_block_indices: set[int] = set()
         for i, blk in enumerate(blocks):
-            sfx_pres = (sfx_profiles[i] is not None
+            sfx_pres = (i < len(sfx_profiles)
+                        and sfx_profiles[i] is not None
                         and sfx_profiles[i].should_preserve_pixels)
             if i in translated_block_indices and not sfx_pres:
                 continue
