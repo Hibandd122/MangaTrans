@@ -4,19 +4,20 @@ Engines hỗ trợ:
   - paddleocr (PP-OCRv5, accuracy cao cho Latin + zh, primary cho en/vi/zh)
   - easyocr   (multi-lang, fallback hoặc primary cho ko)
   - manga-ocr (Nhật, accuracy cao cho kana+kanji vertical)
+  - tesseract (binary external, fallback cho Latin in ấn rõ)
 
 Khi user chỉ định `--ocr-engine auto`:
   Router map từ language code → preferred engine:
       ja  → manga-ocr (nếu có) > easyocr ja
       ko  → easyocr ko
       zh  → paddleocr ch > easyocr ch_sim/ch_tra
-      en  → paddleocr en > easyocr en
+      en  → paddleocr en > easyocr en > tesseract eng
       vi  → paddleocr en (latin script) > easyocr vi
       mixed/unknown → easyocr với lang combo
   Mỗi block: chạy primary → nếu confidence < threshold → retry với preprocessing
   upscale/denoise/sharpen → nếu vẫn fail → secondary engine fallback.
 
-Lazy import: từng engine chỉ load khi cần. Không có dep cứng vào paddleocr/manga-ocr.
+Lazy import: từng engine chỉ load khi cần. Không có dep cứng vào paddleocr/manga-ocr/tesseract.
 """
 from __future__ import annotations
 
@@ -85,8 +86,8 @@ def _clean_ocr_artifacts(text: str) -> str:
 class OCRRouterConfig:
     """Cấu hình router. Bổ sung cho OCRConfig hiện có."""
 
-    # 'auto' | 'paddleocr' | 'easyocr' | 'manga_ocr' | 'paddleocr_vl' | 'mit_48px'
-    engine: str = "paddleocr"
+    # 'auto' | 'paddleocr' | 'easyocr' | 'manga_ocr' | 'tesseract' | 'paddleocr_vl' | 'mit_48px'
+    engine: str = "auto"
     use_paddleocr_for_latin: bool = True   # paddleocr primary cho en/vi/zh
     use_manga_ocr_for_ja: bool = True
     confidence_floor: float = 0.50   # < floor → retry preprocessing
@@ -221,7 +222,7 @@ class _EnginePaddleOCRVL:
                 from paddleocr import PaddleOCR
             except ImportError as e:
                 raise RuntimeError("Cần cài paddleocr để dùng PaddleOCR-VL") from e
-            self._predictor = PaddleOCR(use_vl=True, lang="en")
+            self._predictor = PaddleOCR(use_vl=True, lang="en", enable_mkldnn=False)
         return self._predictor
 
     def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
@@ -238,7 +239,28 @@ class _EnginePaddleOCRVL:
         return " ".join(texts), float(np.mean(scores))
 
 
+class _EngineMangaOCR:
+    """Wrap manga-ocr. Chuyên Nhật, accuracy cao trên kana + kanji + vertical."""
 
+    def __init__(self):
+        self._reader = None
+
+    def _ensure(self):
+        if self._reader is None:
+            from manga_ocr import MangaOcr
+            self._reader = MangaOcr()
+        return self._reader
+
+    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
+        del langs  # always Japanese
+        from PIL import Image
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
+        pil = Image.fromarray(rgb)
+        text = self._ensure()(pil)
+        # manga-ocr không trả conf — ước lượng theo length / không-empty
+        text = (text or "").strip()
+        conf = 0.85 if text else 0.0
+        return text, conf
 
 
 class _EngineMIT48px:
@@ -335,9 +357,12 @@ class OCRRouter:
         self._log = get_logger()
         self._paddleocr: Optional[_EnginePaddleOCR] = None
         self._paddleocr_vl: Optional[_EnginePaddleOCRVL] = None
+        self._manga_ocr: Optional[_EngineMangaOCR] = None
         self._mit_48px: Optional[_EngineMIT48px] = None
-
-        self._available = {"paddleocr": None, "paddleocr_vl": None, "mit_48px": None}
+        # Track engine availability — đánh dấu False sau lần đầu fail load
+        self._available = {"paddleocr": None,
+                           "manga_ocr": None,
+                           "paddleocr_vl": None, "mit_48px": None}
 
     # --------------------------- Public --------------------------- #
 
@@ -408,6 +433,7 @@ class OCRRouter:
     def release(self) -> None:
         self._paddleocr = None
         self._paddleocr_vl = None
+        self._manga_ocr = None
         self._mit_48px = None
 
     # --------------------------- Internals --------------------------- #
@@ -417,13 +443,13 @@ class OCRRouter:
         """Return (primary, secondary) engine names."""
         cfg = self.router_cfg
         if cfg.engine != "auto":
-            return cfg.engine, None
+            return cfg.engine, "easyocr" if cfg.engine != "easyocr" else None
 
         # PaddleOCR là engine chính cho MỌI ngôn ngữ (nhanh + chính xác)
         if self._is_available("paddleocr"):
             return "paddleocr", None
 
-        # Không có fallback nếu không có tesseract/easyocr
+        # Fallback: không có easyocr nên trả về None nếu không có paddleocr
         return "paddleocr", None
 
     def _is_available(self, engine: str) -> bool:
@@ -432,6 +458,8 @@ class OCRRouter:
         try:
             if engine in ("paddleocr", "paddleocr_vl"):
                 __import__("paddleocr")
+            elif engine == "manga_ocr":
+                __import__("manga_ocr")
             elif engine == "mit_48px":
                 pass # check logic cho mit_48px package
             self._available[engine] = True
@@ -455,7 +483,10 @@ class OCRRouter:
                 if self._paddleocr_vl is None:
                     self._paddleocr_vl = _EnginePaddleOCRVL()
                 return self._paddleocr_vl.read(crop, langs)
-
+            if name == "manga_ocr":
+                if self._manga_ocr is None:
+                    self._manga_ocr = _EngineMangaOCR()
+                return self._manga_ocr.read(crop, langs)
             if name == "mit_48px":
                 if self._mit_48px is None:
                     self._mit_48px = _EngineMIT48px()

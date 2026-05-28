@@ -42,8 +42,9 @@ SCRIPT_RANGES: dict[str, tuple[tuple[int, int], ...]] = {
 # CJK fullwidth punctuation set
 CJK_PUNCT = set("。、！？「」『』〝〞・…—《》〈〉【】（）")
 
-# Candidate language combos cho EasyOCR preview. Mỗi combo có:
-#   - langs: tuple lang codes EasyOCR
+# Candidate language combos cho OCR preview. Mỗi combo có:
+#   - langs: tuple lang codes
+
 #   - name: hiển thị cho log
 #   - markers: script keys liên quan → matched glyph cộng điểm
 LANG_CANDIDATES: tuple[dict, ...] = (
@@ -84,7 +85,7 @@ class LanguageDetection:
 
     code: str                          # 'ja' | 'ko' | 'zh_sim' | 'zh_tra' | 'en' | 'vi'
     name: str
-    langs: tuple[str, ...]             # EasyOCR lang list
+    langs: tuple[str, ...]             # OCR lang list
     score: float                       # tổng score sau bonus
     raw_scores: dict[str, float] = field(default_factory=dict)
     primary_script: str = "unknown"    # tag thuận tiện cho downstream (ocr_router)
@@ -97,7 +98,7 @@ class LanguageDetector:
     """Multi-tier language detector. Cache cross-page.
 
     Thread-safe: lock quanh `_cached` cho async pipeline có thể gọi detect()
-    từ nhiều page concurrent (GPU mutex serialize Paddle/EasyOCR nhưng cache
+    từ nhiều page concurrent (GPU mutex serialize PaddleOCR nhưng cache
     write vẫn cần atomic).
     """
 
@@ -134,11 +135,11 @@ class LanguageDetector:
 
         layout_hint = self._infer_layout(blocks)
 
-        # Try EasyOCR-based glyph detection. Failure → fallback heuristic.
+        # Try OCR-based glyph detection. Failure → fallback heuristic.
         try:
             scores, glyph_counts, mixed = self._score_candidates(crops, layout_hint)
         except Exception as e:  # noqa: BLE001
-            self._log.warning(f"[LangDetect] EasyOCR preview fail ({e}) → fallback en")
+            self._log.warning(f"[LangDetect] OCR preview fail ({e}) → fallback en")
             self._cached = self._fallback("en", f"OCR fail: {e}")
             return self._cached
 
@@ -254,9 +255,9 @@ class LanguageDetector:
             plang = paddle_lang_map.get(cand["code"])
             if not plang:
                 continue
-
             try:
-                reader = PaddleOCR(use_angle_cls=True, lang=plang, show_log=False)
+                # Bắt buộc enable_mkldnn=False để tránh crash mộtDNN PIR trên Windows
+                reader = PaddleOCR(use_angle_cls=True, lang=plang, enable_mkldnn=False)
             except Exception as e:  # noqa: BLE001
                 self._log.debug(f"   [LangDetect] init {cand['name']} fail: {e}")
                 continue
