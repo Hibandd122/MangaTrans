@@ -138,7 +138,8 @@ class _EnginePaddleOCR:
     }
 
     def __init__(self, disable_mkldnn: bool = True):
-        self._predictors: dict[str, object] = {}
+        self._predictor = None
+        self._active_lang: Optional[str] = None
         self._disable_mkldnn = disable_mkldnn
         if disable_mkldnn:
             # Phải set TRƯỚC khi import paddle — nếu paddle đã load thì flag vô hiệu
@@ -167,8 +168,8 @@ class _EnginePaddleOCR:
     }
 
     def _ensure(self, paddle_lang: str):
-        if paddle_lang not in self._predictors:
-            from paddleocr import PaddleOCR
+        if self._predictor is None or getattr(self, "_active_lang", None) != paddle_lang:
+            from .paddle_cache import get_paddleocr
             kwargs = dict(
                 lang=paddle_lang,
                 use_doc_orientation_classify=False,
@@ -183,8 +184,9 @@ class _EnginePaddleOCR:
                 kwargs["text_recognition_model_name"] = rec_model
             if self._disable_mkldnn:
                 kwargs["enable_mkldnn"] = False
-            self._predictors[paddle_lang] = PaddleOCR(**kwargs)
-        return self._predictors[paddle_lang]
+            self._predictor = get_paddleocr(**kwargs)
+            self._active_lang = paddle_lang
+        return self._predictor
 
     def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
         paddle_lang = self._pick_lang(langs)
@@ -223,10 +225,10 @@ class _EnginePaddleOCRVL:
     def _ensure(self):
         if self._predictor is None:
             try:
-                from paddleocr import PaddleOCR
+                from .paddle_cache import get_paddleocr
             except ImportError as e:
                 raise RuntimeError("Cần cài paddleocr để dùng PaddleOCR-VL") from e
-            self._predictor = PaddleOCR(use_vl=True, lang="en", enable_mkldnn=False)
+            self._predictor = get_paddleocr(use_vl=True, lang="en", enable_mkldnn=False)
         return self._predictor
 
     def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:

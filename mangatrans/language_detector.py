@@ -232,6 +232,7 @@ class LanguageDetector:
         """
         try:
             from paddleocr import PaddleOCR
+            from .paddle_cache import get_paddleocr
         except ImportError as e:
             raise RuntimeError("Cần cài paddleocr") from e
 
@@ -257,7 +258,7 @@ class LanguageDetector:
                 continue
             try:
                 # Bắt buộc enable_mkldnn=False để tránh crash mộtDNN PIR trên Windows
-                reader = PaddleOCR(use_angle_cls=True, lang=plang, enable_mkldnn=False)
+                reader = get_paddleocr(use_angle_cls=True, lang=plang, enable_mkldnn=False)
             except Exception as e:  # noqa: BLE001
                 self._log.debug(f"   [LangDetect] init {cand['name']} fail: {e}")
                 continue
