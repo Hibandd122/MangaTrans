@@ -128,12 +128,17 @@ class TranslationPipeline:
         self._page_idx = page_idx
         cfg = self.config
 
-        # Filter translate candidates
+        # Filter translate candidates. Do not send OCR misses/blank crops to the
+        # LLM; otherwise it may translate only our metadata tags.
         if cfg.sfx_skip_preserve_pixels:
             kept = [i for i, r in enumerate(ocr_results)
-                    if not r.get("should_preserve_pixels")]
+                    if not r.get("should_preserve_pixels")
+                    and r.get("should_translate", True) is not False
+                    and (r.get("text") or "").strip()]
         else:
-            kept = list(range(len(ocr_results)))
+            kept = [i for i, r in enumerate(ocr_results)
+                    if r.get("should_translate", True) is not False
+                    and (r.get("text") or "").strip()]
 
         if not kept:
             return [""] * len(ocr_results)
@@ -145,6 +150,11 @@ class TranslationPipeline:
         texts = [ocr_results[i]["text"] for i in ordered_global_idx]
         if cfg.sanitize_punctuation:
             texts = [_sanitize_punctuation(t) for t in texts]
+        nonempty = [(i, t) for i, t in zip(ordered_global_idx, texts) if t]
+        if not nonempty:
+            return [""] * len(ocr_results)
+        ordered_global_idx = [i for i, _ in nonempty]
+        texts = [t for _, t in nonempty]
         position_tags = [
             position_tag(ocr_results[i]["bbox"], page_w, page_h)
             for i in ordered_global_idx

@@ -3,7 +3,7 @@
 Flow (single path — sau refactor 2026-05-25):
     detect → dedupe → split → recover_missed
     → LanguageDetector
-    → OCRRouter (PaddleOCR / EasyOCR / manga-ocr)
+    → OCRRouter (PaddleOCR)
     → SFXDetector
     → TranslationPipeline (role-aware, OpenRouter)
     → preserve stylized CJK SFX
@@ -84,7 +84,7 @@ class MangaPipeline:
         # Backward-compat alias — một số test cũ truy cập .detector
         self.detector = self.bubble_detector.raw
 
-        # OCR Router (PaddleOCR primary, EasyOCR fallback, manga-ocr cho ja)
+        # OCR Router (PaddleOCR primary)
         self.ocr_router = OCRRouter(self.config.ocr, self.config.ocr_router)
 
         self.language_detector = (
@@ -232,7 +232,7 @@ class MangaPipeline:
         return ctx
 
     def stage_ocr(self, ctx: Dict[str, Any]) -> Dict[str, Any]:
-        """OCR via Router. Stage GPU (Paddle/EasyOCR/manga-ocr)."""
+        """OCR via Router. Stage GPU/CPU depending on PaddleOCR runtime."""
         ocr_results: list[dict] = []
         blocks = ctx["blocks"]
         if blocks:
@@ -273,6 +273,11 @@ class MangaPipeline:
             for r in ocr_results:
                 idx = r.get("block_idx")
                 if not isinstance(idx, int) or idx < 0 or idx >= len(sfx_profiles):
+                    continue
+                if r.get("ocr_failed"):
+                    r["role"] = "unknown"
+                    r["should_translate"] = False
+                    r["should_preserve_pixels"] = True
                     continue
                 p = sfx_profiles[idx]
                 if p is not None:
@@ -397,6 +402,15 @@ class MangaPipeline:
         """
         cfg = self.config
         log = self._log
+        translatable = [
+            r for r in ocr_results
+            if (r.get("text") or "").strip()
+            and r.get("should_translate", True) is not False
+            and not r.get("should_preserve_pixels")
+        ]
+        if not translatable:
+            log.info("   - Không có OCR text hợp lệ để dịch, bỏ qua OpenRouter.")
+            return
 
         # Glossary path
         if cfg.translate.use_glossary:
