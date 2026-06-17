@@ -49,14 +49,14 @@ class LamaInpainter(BaseInpainter):
                 if self._cpu_entry is not None:
                     return self._cpu_entry
                 model = torch.jit.load(self.model_path, map_location="cpu").eval()
-                target = self._override_size or 512
+                target = self._override_size or 768
                 self._cpu_entry = _SessionEntry(model, "cpu", target)
                 return self._cpu_entry
             if self._entry is not None:
                 return self._entry
             device = "cuda" if torch.cuda.is_available() else "cpu"
             model = torch.jit.load(self.model_path, map_location=device).eval()
-            target = self._override_size or 512
+            target = self._override_size or 768
             self._entry = _SessionEntry(model, device, target)
             return self._entry
 

@@ -166,7 +166,7 @@ class LamaInpainter:
         import torch
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = torch.jit.load(self.model_path, map_location=device).eval()
-        target = self._override_size or 512
+        target = self._override_size or 768
         self._entry = _SessionEntry(model, device, target)
         return self._entry
 
@@ -335,8 +335,20 @@ def _feather(mask_u8: np.ndarray, ksize: int) -> np.ndarray:
     """Mask → float32 (H,W,1) feather alpha, range [0,1]."""
     if ksize % 2 == 0:
         ksize += 1
+    ksize = max(3, min(ksize, 51))
     f = cv2.GaussianBlur(mask_u8.astype(np.float32) / 255.0, (ksize, ksize), 0)
     return np.clip(f, 0, 1)[..., None]
+
+
+def _adaptive_feather_ksize(area: int) -> int:
+    """Scale feather kernel with component area."""
+    if area < 500:
+        return 7
+    if area < 2000:
+        return 11
+    if area < 8000:
+        return 15
+    return 21
 
 
 class HybridRedrawer:
@@ -379,7 +391,9 @@ class HybridRedrawer:
         except Exception as e:  # noqa: BLE001
             self._log.warning(f"⚠️  LaMa whole-image fail ({e}), fallback cv2.inpaint")
             return self._cv_inpaint(image, mask)
-        mask_f = _feather(mask, 13)
+        area = int((mask > 0).sum())
+        ksize = _adaptive_feather_ksize(area)
+        mask_f = _feather(mask, ksize)
         blended = image.astype(np.float32) * (1 - mask_f) + out.astype(np.float32) * mask_f
         return np.clip(blended, 0, 255).astype(np.uint8)
 
@@ -417,9 +431,10 @@ class HybridRedrawer:
             else:
                 kind, params = "TEXTURE", None
 
+            fk = _adaptive_feather_ksize(area)
             if kind == "SOLID" and params is not None:
                 filled = fill_solid(image, comp_mask_dil, params["color"])
-                mask_f = _feather(comp_mask_dil, 9)
+                mask_f = _feather(comp_mask_dil, fk)
                 result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
                 composite_mask = np.maximum(composite_mask, mask_f[..., 0])
                 n_solid += 1
@@ -427,7 +442,7 @@ class HybridRedrawer:
             if kind == "GRADIENT" and params is not None:
                 filled = fill_gradient(image, comp_mask_dil,
                                        params["coef"], params["ref_color"])
-                mask_f = _feather(comp_mask_dil, 9)
+                mask_f = _feather(comp_mask_dil, fk)
                 result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
                 composite_mask = np.maximum(composite_mask, mask_f[..., 0])
                 n_gradient += 1
@@ -450,7 +465,8 @@ class HybridRedrawer:
                     if refined is not None:
                         tile_out = refined
 
-            tile_mask_f = _feather(tile_mask, 13)
+            tile_fk = _adaptive_feather_ksize(int((tile_mask > 0).sum()))
+            tile_mask_f = _feather(tile_mask, tile_fk)
             region = result[y1:y2, x1:x2]
             result[y1:y2, x1:x2] = (
                 region * (1 - tile_mask_f)
@@ -506,7 +522,8 @@ class HybridRedrawer:
 
     def _refine_tile(self, tile_out: np.ndarray, tile_mask: np.ndarray,
                      bw: int, bh: int, model_size: int) -> Optional[np.ndarray]:
-        shrink_k = max(3, int(min(bw, bh) * 0.15))
+        """Pass-2 refine: mask co lại 25% short side."""
+        shrink_k = max(3, int(min(bw, bh) * 0.25))
         if shrink_k % 2 == 0:
             shrink_k += 1
         shrink_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (shrink_k, shrink_k))
@@ -519,7 +536,9 @@ class HybridRedrawer:
         except Exception as e:  # noqa: BLE001
             self._log.debug(f"refine fail ({e}) — giữ pass-1")
             return None
-        core_f = _feather(tile_mask_core, 15)
+        core_area = int((tile_mask_core > 0).sum())
+        core_fk = _adaptive_feather_ksize(core_area)
+        core_f = _feather(tile_mask_core, core_fk)
         return (tile_out.astype(np.float32) * (1 - core_f)
                 + tile_out2.astype(np.float32) * core_f)
 
@@ -535,15 +554,18 @@ class HybridRedrawer:
 @dataclass
 class RedrawEngineConfig:
     enable_edge_preserve: bool = True
-    edge_canny_lo: int = 40
-    edge_canny_hi: int = 120
-    edge_dilate_px: int = 1
+    edge_canny_lo: int = 30          # lowered for thin manga lines
+    edge_canny_hi: int = 100
+    edge_dilate_px: int = 2          # raised for thicker line protection
     enable_screentone_pass: bool = True
     screentone_min_periodicity: float = 0.15
     enable_unsharp_post: bool = True
     unsharp_radius: int = 3
-    unsharp_amount: float = 0.4
+    unsharp_amount: float = 0.5      # raised from 0.4
     huge_mask_ratio: float = 0.05
+    enable_color_match: bool = True
+    color_match_rim_px: int = 16
+    color_match_strength: float = 0.7
 
 
 @dataclass
@@ -553,6 +575,8 @@ class RedrawReport:
     post_ssim: float = 0.0
     used_screentone: bool = False
     used_edge_preserve: bool = False
+    used_color_match: bool = False
+    n_screentone_regions: int = 0
 
 
 class RedrawEngine:
@@ -589,10 +613,28 @@ class RedrawEngine:
                 f"{cfg.huge_mask_ratio:.0%} → multi-pass mode"
             )
 
+        # Screentone pre-pass
+        if cfg.enable_screentone_pass:
+            screentone_mask = self._detect_screentone_regions(
+                image, working_mask)
+            if screentone_mask is not None and screentone_mask.sum() > 0:
+                report.used_screentone = True
+                report.n_screentone_regions = int((screentone_mask > 0).sum())
+                image = self._screentone_fill(image, screentone_mask)
+                working_mask = cv2.bitwise_and(
+                    working_mask, cv2.bitwise_not(screentone_mask))
+
         result = self._hybrid.redraw(image, working_mask)
 
+        # Color matching post-inpaint
+        if cfg.enable_color_match:
+            result = self._color_match_rim(
+                image, result, mask, cfg.color_match_rim_px,
+                cfg.color_match_strength)
+            report.used_color_match = True
+
         if cfg.enable_unsharp_post:
-            result = self._unsharp_in_mask(result, working_mask)
+            result = self._unsharp_in_mask(result, mask)
 
         return result, report
 
@@ -611,7 +653,7 @@ class RedrawEngine:
 
         rim = cv2.morphologyEx(mask, cv2.MORPH_GRADIENT,
                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
-                                                         (11, 11)))
+                                                         (15, 15)))
         edge_in_rim = cv2.bitwise_and(edges, rim)
         if edge_in_rim.sum() == 0:
             return mask
@@ -619,6 +661,89 @@ class RedrawEngine:
         if keep.sum() < mask.sum() * 0.7:
             return mask
         return keep
+
+    def _detect_screentone_regions(self, image: np.ndarray,
+                                   mask: np.ndarray) -> Optional[np.ndarray]:
+        """Detect screentone CC within mask via FFT periodicity."""
+        cfg = self.engine_cfg
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) \
+            if image.ndim == 3 else image
+        mask_bin = (mask > 127).astype(np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_bin)
+        if num <= 1:
+            return None
+        screentone_mask = np.zeros_like(mask)
+        for i in range(1, num):
+            x, y, bw, bh, area = stats[i]
+            if area < 100:
+                continue
+            comp = (labels == i).astype(np.uint8)
+            pad = 20
+            rx1 = max(0, x - pad)
+            ry1 = max(0, y - pad)
+            rx2 = min(gray.shape[1], x + bw + pad)
+            ry2 = min(gray.shape[0], y + bh + pad)
+            rim_crop = gray[ry1:ry2, rx1:rx2]
+            if rim_crop.size < 400:
+                continue
+            periodicity = detect_screentone(rim_crop)
+            if periodicity >= cfg.screentone_min_periodicity:
+                screentone_mask[comp > 0] = 255
+        return screentone_mask if screentone_mask.sum() > 0 else None
+
+    def _screentone_fill(self, image: np.ndarray,
+                         screentone_mask: np.ndarray) -> np.ndarray:
+        """NS inpaint for screentone regions (preserves dot patterns better)."""
+        if screentone_mask.sum() == 0:
+            return image
+        dil = cv2.dilate(screentone_mask,
+                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        result = cv2.inpaint(image, dil, 5, cv2.INPAINT_NS)
+        alpha = cv2.GaussianBlur(dil.astype(np.float32) / 255.0, (9, 9), 0)
+        alpha = np.clip(alpha, 0, 1)[..., None]
+        blended = image.astype(np.float32) * (1 - alpha) + \
+            result.astype(np.float32) * alpha
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
+    def _color_match_rim(self, original: np.ndarray, inpainted: np.ndarray,
+                         mask: np.ndarray, rim_px: int,
+                         strength: float) -> np.ndarray:
+        """Match inpainted region color/brightness to surrounding rim."""
+        if strength <= 0 or mask.sum() == 0:
+            return inpainted
+        mask_bin = (mask > 127).astype(np.uint8)
+        k = np.ones((rim_px * 2 + 1, rim_px * 2 + 1), np.uint8)
+        dilated = cv2.dilate(mask_bin, k)
+        rim = (dilated > 0) & (mask_bin == 0)
+        if rim.sum() < 50:
+            return inpainted
+        orig_rim = original[rim].astype(np.float32)
+        inp_rim = inpainted[rim].astype(np.float32)
+        result = inpainted.copy().astype(np.float32)
+        mask_pixels = mask_bin > 0
+        n_ch = min(3, original.shape[2]) if original.ndim == 3 else 1
+        for c in range(n_ch):
+            if original.ndim == 3:
+                orig_mean = orig_rim[:, c].mean()
+                orig_std = max(1.0, orig_rim[:, c].std())
+                inp_mean = inp_rim[:, c].mean()
+                inp_std = max(1.0, inp_rim[:, c].std())
+                channel = result[:, :, c]
+                corrected = (channel[mask_pixels] - inp_mean) * \
+                    (orig_std / inp_std) + orig_mean
+                channel[mask_pixels] = channel[mask_pixels] * (1 - strength) + \
+                    corrected * strength
+                result[:, :, c] = channel
+            else:
+                orig_mean = orig_rim.mean()
+                orig_std = max(1.0, orig_rim.std())
+                inp_mean = inp_rim.mean()
+                inp_std = max(1.0, inp_rim.std())
+                corrected = (result[mask_pixels] - inp_mean) * \
+                    (orig_std / inp_std) + orig_mean
+                result[mask_pixels] = result[mask_pixels] * (1 - strength) + \
+                    corrected * strength
+        return np.clip(result, 0, 255).astype(np.uint8)
 
     def _unsharp_in_mask(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         cfg = self.engine_cfg

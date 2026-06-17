@@ -32,8 +32,20 @@ def _feather(mask_u8: np.ndarray, ksize: int) -> np.ndarray:
     """Mask → float32 (H,W,1) feather alpha, range [0,1]."""
     if ksize % 2 == 0:
         ksize += 1
+    ksize = max(3, min(ksize, 51))  # clamp to valid range
     f = cv2.GaussianBlur(mask_u8.astype(np.float32) / 255.0, (ksize, ksize), 0)
     return np.clip(f, 0, 1)[..., None]
+
+
+def _adaptive_feather_ksize(area: int) -> int:
+    """Scale feather kernel with component area. Small CC = tight blend, large = wide."""
+    if area < 500:
+        return 7
+    if area < 2000:
+        return 11
+    if area < 8000:
+        return 15
+    return 21
 
 
 class HybridRedrawer:
@@ -92,7 +104,9 @@ class HybridRedrawer:
         except Exception as e:  # noqa: BLE001 — fallback bất kỳ exception nào
             self._log.warning(f"⚠️  LaMa whole-image fail ({e}), fallback cv2.inpaint")
             return self._cv_inpaint(image, mask)
-        mask_f = _feather(mask, 13)
+        area = int((mask > 0).sum())
+        ksize = _adaptive_feather_ksize(area)
+        mask_f = _feather(mask, ksize)
         blended = image.astype(np.float32) * (1 - mask_f) + out.astype(np.float32) * mask_f
         return np.clip(blended, 0, 255).astype(np.uint8)
 
@@ -134,9 +148,10 @@ class HybridRedrawer:
             else:
                 kind, params = "TEXTURE", None
 
+            fk = _adaptive_feather_ksize(area)
             if kind == "SOLID" and params is not None:
                 filled = fill_solid(image, comp_mask_dil, params["color"])
-                mask_f = _feather(comp_mask_dil, 9)
+                mask_f = _feather(comp_mask_dil, fk)
                 result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
                 composite_mask = np.maximum(composite_mask, mask_f[..., 0])
                 n_solid += 1
@@ -144,7 +159,7 @@ class HybridRedrawer:
             if kind == "GRADIENT" and params is not None:
                 filled = fill_gradient(image, comp_mask_dil,
                                        params["coef"], params["ref_color"])
-                mask_f = _feather(comp_mask_dil, 9)
+                mask_f = _feather(comp_mask_dil, fk)
                 result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
                 composite_mask = np.maximum(composite_mask, mask_f[..., 0])
                 n_gradient += 1
@@ -170,7 +185,8 @@ class HybridRedrawer:
                     if refined is not None:
                         tile_out = refined
 
-            tile_mask_f = _feather(tile_mask, 13)
+            tile_fk = _adaptive_feather_ksize(int((tile_mask > 0).sum()))
+            tile_mask_f = _feather(tile_mask, tile_fk)
             region = result[y1:y2, x1:x2]
             result[y1:y2, x1:x2] = (
                 region * (1 - tile_mask_f)
@@ -231,8 +247,9 @@ class HybridRedrawer:
 
     def _refine_tile(self, tile_out: np.ndarray, tile_mask: np.ndarray,
                      bw: int, bh: int, model_size: int) -> Optional[np.ndarray]:
-        """Pass-2 refine: mask co lại 15% short side, chỉ refine lõi."""
-        shrink_k = max(3, int(min(bw, bh) * 0.15))
+        """Pass-2 refine: mask co lại 25% short side, chỉ refine lõi.
+        Stronger shrink than v1 (15%) to avoid under-refining large blocks."""
+        shrink_k = max(3, int(min(bw, bh) * 0.25))
         if shrink_k % 2 == 0:
             shrink_k += 1
         shrink_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (shrink_k, shrink_k))
@@ -245,7 +262,9 @@ class HybridRedrawer:
         except Exception as e:  # noqa: BLE001
             self._log.debug(f"refine fail ({e}) — giữ pass-1")
             return None
-        core_f = _feather(tile_mask_core, 15)
+        core_area = int((tile_mask_core > 0).sum())
+        core_fk = _adaptive_feather_ksize(core_area)
+        core_f = _feather(tile_mask_core, core_fk)
         return (tile_out.astype(np.float32) * (1 - core_f)
                 + tile_out2.astype(np.float32) * core_f)
 
