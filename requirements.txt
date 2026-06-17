@@ -27,6 +27,7 @@ torchvision==0.20.1+cu121
 # -------------------- OCR engines --------------------
 paddleocr==3.5.0
 paddlepaddle==3.3.1
+langchain-text-splitters>=0.2.0
 
 
 
