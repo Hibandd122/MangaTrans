@@ -142,8 +142,6 @@ class _EnginePaddleOCR:
     _REC_MODEL_SERVER = {
         "en": "en_PP-OCRv5_server_rec",
         "ch": "ch_PP-OCRv5_server_rec",
-        "japan": "japan_PP-OCRv5_server_rec",
-        "korean": "korean_PP-OCRv5_server_rec",
     }
 
     # Mobile models — faster fallback
