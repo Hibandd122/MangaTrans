@@ -335,25 +335,21 @@ class OCRRouter:
     def run_blocks(self, image: np.ndarray, blocks: list[dict],
                    detection: LanguageDetection) -> list[dict]:
         """OCR mỗi block. Trả list dict tương thích pipeline cũ."""
+        results: list[dict] = []
         pad = self.ocr_cfg.crop_pad
         h, w = image.shape[:2]
         n = len(blocks)
-        results: list[Optional[dict]] = [None] * n
-
-        def _process_block(i: int, blk: dict) -> dict:
+        for i, blk in enumerate(blocks):
             x1, y1, x2, y2 = blk["bbox"]
             x1 = max(0, int(x1) - pad)
             y1 = max(0, int(y1) - pad)
             x2 = min(w, int(x2) + pad)
             y2 = min(h, int(y2) + pad)
             crop = image[y1:y2, x1:x2]
-            
             if crop.size == 0:
-                return None
-
+                continue
             res = self.read_crop(crop, detection)
             cleaned_text = _clean_ocr_artifacts(res.text)
-            
             item = {
                 "bbox": [x1, y1, x2, y2],
                 "block_idx": i,
@@ -370,26 +366,13 @@ class OCRRouter:
                     "should_translate": False,
                     "should_preserve_pixels": True,
                 })
-            
+            results.append(item)
             self._log.info(
                 f"  [{i + 1}/{n}] ({x1},{y1})-({x2},{y2}) "
                 f"-> {cleaned_text!r} [{res.engine}/{res.variant}, "
                 f"conf={res.confidence:.2f}]"
             )
-            return item
-
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(_process_block, i, blk): i for i, blk in enumerate(blocks)}
-            for fut in concurrent.futures.as_completed(futures):
-                i = futures[fut]
-                try:
-                    results[i] = fut.result()
-                except Exception as e:
-                    self._log.error(f"Error processing block {i}: {e}")
-                    results[i] = None
-
-        return [r for r in results if r is not None]
+        return results
 
     def read_crop(self, crop: np.ndarray,
                   detection: LanguageDetection) -> OCRResult:

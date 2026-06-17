@@ -81,7 +81,7 @@ class OCRRouterConfig:
     use_manga_ocr_for_ja: bool = False       # disabled — PaddleOCR only
     confidence_floor: float = 0.55           # raised for stricter filtering
     confidence_secondary: float = 0.30
-    max_retries: int = 3                     # raised — more preprocessing attempts
+    max_retries: int = 0                     # Giảm xuống 0 để tránh OCR retry quá nhiều lần làm chậm máy
     paddleocr_disable_mkldnn: bool = True    # tránh PIR/oneDNN crash trên Windows
     # Use server models for higher accuracy
     use_server_model: bool = True
