@@ -186,8 +186,6 @@ class _EnginePaddleOCR:
                 rec_model = self._REC_MODEL_MOBILE.get(paddle_lang)
             if det_model:
                 kwargs["text_detection_model_name"] = det_model
-            if rec_model:
-                kwargs["text_recognition_model_name"] = rec_model
             if self._disable_mkldnn:
                 kwargs["enable_mkldnn"] = False
             self._predictors[paddle_lang] = PaddleOCR(**kwargs)
