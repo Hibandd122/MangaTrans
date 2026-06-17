@@ -107,7 +107,7 @@ class MangaPipeline:
         )
         self._page_counter = 0
         self.raise_translation_errors = False  # legacy mode: swallow errors
-        self._gpu_lock = threading.Lock()  # GPU mutex cho multithreaded batch
+        self._gpu_lock = threading.Semaphore(2)  # GPU mutex cho multithreaded batch
 
         # Render: TypographyEngine (4-tier shape-aware fit)
         self._typo_engine = TypographyEngine(
