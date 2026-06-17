@@ -125,6 +125,10 @@ class HybridRedrawer:
         composite_mask = np.zeros((h, w), dtype=np.float32)
         n_solid = n_gradient = n_tiles = n_fallback = 0
 
+        import concurrent.futures
+        
+        # Phase 1: Prepare tasks and classify
+        tasks = []
         for i in range(1, num):
             x, y, bw, bh, area = stats[i]
             if area < cfg.min_component_area:
@@ -137,7 +141,6 @@ class HybridRedrawer:
                 iterations=1,
             )
 
-            # --- Classify dispatch ---
             if cfg.classify:
                 kind, params = classify_component_texture(
                     image, comp_mask_dil,
@@ -147,39 +150,38 @@ class HybridRedrawer:
                 )
             else:
                 kind, params = "TEXTURE", None
-
+            tasks.append((i, x, y, bw, bh, area, comp_mask_dil, kind, params))
+        
+        # Phase 2: Execute time-consuming LaMa inpaintings concurrently
+        def _process_task(task):
+            i, x, y, bw, bh, area, comp_mask_dil, kind, params = task
             fk = _adaptive_feather_ksize(area)
+            
             if kind == "SOLID" and params is not None:
                 filled = fill_solid(image, comp_mask_dil, params["color"])
                 mask_f = _feather(comp_mask_dil, fk)
-                result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
-                composite_mask = np.maximum(composite_mask, mask_f[..., 0])
-                n_solid += 1
-                continue
+                return ("SOLID", mask_f, filled, None)
+                
             if kind == "GRADIENT" and params is not None:
                 filled = fill_gradient(image, comp_mask_dil,
                                        params["coef"], params["ref_color"])
                 mask_f = _feather(comp_mask_dil, fk)
-                result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
-                composite_mask = np.maximum(composite_mask, mask_f[..., 0])
-                n_gradient += 1
-                continue
+                return ("GRADIENT", mask_f, filled, None)
 
-            # --- TEXTURE path: HD tile + refiner ---
+            # TEXTURE path
             tile = self._compute_tile_bounds(x, y, bw, bh, w, h)
             x1, y1, x2, y2 = tile
             tile_img = image[y1:y2, x1:x2]
             tile_mask = mask[y1:y2, x1:x2]
             if tile_mask.sum() == 0:
-                continue
+                return None
 
             tile_out = self._run_tile_with_fallback(tile_img, tile_mask, model_size)
+            is_fallback = False
             if tile_out is None:
-                n_fallback += 1
-                # Fallback cuối: cv2.inpaint trên tile, paste lại.
+                is_fallback = True
                 tile_out = cv2.inpaint(tile_img, tile_mask, 3, cv2.INPAINT_TELEA)
             else:
-                # Refiner pass thứ 2 chỉ trên LaMa output (không refine cv2 fallback).
                 if cfg.refine and tile_mask.sum() > 100:
                     refined = self._refine_tile(tile_out, tile_mask, bw, bh, model_size)
                     if refined is not None:
@@ -187,15 +189,33 @@ class HybridRedrawer:
 
             tile_fk = _adaptive_feather_ksize(int((tile_mask > 0).sum()))
             tile_mask_f = _feather(tile_mask, tile_fk)
-            region = result[y1:y2, x1:x2]
-            result[y1:y2, x1:x2] = (
-                region * (1 - tile_mask_f)
-                + tile_out.astype(np.float32) * tile_mask_f
-            )
-            composite_mask[y1:y2, x1:x2] = np.maximum(
-                composite_mask[y1:y2, x1:x2], tile_mask_f[..., 0],
-            )
-            n_tiles += 1
+            return ("TEXTURE", tile_mask_f, tile_out, (x1, y1, x2, y2), is_fallback)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+            task_results = list(executor.map(_process_task, tasks))
+            
+        # Phase 3: Apply results sequentially to avoid race conditions
+        for res in task_results:
+            if res is None: continue
+            kind = res[0]
+            if kind in ("SOLID", "GRADIENT"):
+                mask_f, filled, _ = res[1], res[2], res[3]
+                result = result * (1 - mask_f) + filled.astype(np.float32) * mask_f
+                composite_mask = np.maximum(composite_mask, mask_f[..., 0])
+                if kind == "SOLID": n_solid += 1
+                else: n_gradient += 1
+            elif kind == "TEXTURE":
+                tile_mask_f, tile_out, (x1, y1, x2, y2), is_fallback = res[1], res[2], res[3], res[4]
+                region = result[y1:y2, x1:x2]
+                result[y1:y2, x1:x2] = (
+                    region * (1 - tile_mask_f)
+                    + tile_out.astype(np.float32) * tile_mask_f
+                )
+                composite_mask[y1:y2, x1:x2] = np.maximum(
+                    composite_mask[y1:y2, x1:x2], tile_mask_f[..., 0],
+                )
+                n_tiles += 1
+                if is_fallback: n_fallback += 1
 
         refine_lbl = " +refine" if cfg.refine else ""
         cls_lbl = (f" | classify: {n_solid} solid, {n_gradient} gradient"
