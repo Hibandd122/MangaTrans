@@ -18,7 +18,7 @@ from typing import Dict, Optional, Sequence
 # user đã chuyển hoàn toàn khỏi Gemini/Groq. Headers HTTP-Referer / X-Title để
 # OpenRouter track app.
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-chat"
 DEFAULT_OPENROUTER_KEY = ""
 
 

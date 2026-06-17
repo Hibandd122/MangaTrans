@@ -1,15 +1,11 @@
-"""OCR Router — chọn OCR engine theo language + confidence, có retry + preprocessing.
-
-Engines hỗ trợ:
-  - paddleocr (PP-OCRv5, primary cho mọi ngôn ngữ)
-  - manga-ocr (Nhật, chỉ dùng khi user cấu hình trực tiếp)
+"""OCR Router — PaddleOCR-only, PP-OCRv5 server models, multi-variant retry.
 
 Khi user chỉ định `--ocr-engine auto`:
-  Router dùng PaddleOCR làm engine duy nhất.
-  Mỗi block: chạy primary → nếu confidence < threshold → retry với preprocessing
-  upscale/denoise/sharpen.
+  Router dùng PaddleOCR làm engine duy nhất (server model cho accuracy).
+  Mỗi block: chạy raw → nếu confidence < threshold → retry với preprocessing
+  variants (CLAHE, denoise, threshold, rotate90).
 
-Lazy import: từng engine chỉ load khi cần.
+Lazy import: PaddleOCR chỉ load khi cần.
 """
 from __future__ import annotations
 
@@ -68,9 +64,9 @@ def _clean_ocr_artifacts(text: str) -> str:
     # Trailing ;/: (kể cả lặp) → .
     s = re.sub(r"[;:]+$", ".", s)
     # Mid-sentence `;`/`:` + space + lowercase → `,`
-    s = re.sub(r"[;:](\s+[a-z])", r",\1", s)
+    s = re.sub(r"[;:](\\s+[a-z])", r",\\1", s)
     # Mid-sentence `;`/`:` + space + Capital → `.` (hai câu nối nhau)
-    s = re.sub(r"[;:](\s+[A-Z])", r".\1", s)
+    s = re.sub(r"[;:](\\s+[A-Z])", r".\\1", s)
     s = _dedup_repeated_words(s)
     return s
 
@@ -79,17 +75,19 @@ def _clean_ocr_artifacts(text: str) -> str:
 class OCRRouterConfig:
     """Cấu hình router. Bổ sung cho OCRConfig hiện có."""
 
-    # 'auto' | 'paddleocr' | 'manga_ocr' | 'paddleocr_vl' | 'mit_48px'
+    # 'auto' | 'paddleocr'
     engine: str = "auto"
-    use_paddleocr_for_latin: bool = True   # paddleocr primary cho en/vi/zh
-    use_manga_ocr_for_ja: bool = True
-    confidence_floor: float = 0.50   # < floor → retry preprocessing
-    confidence_secondary: float = 0.30  # < secondary → switch engine
-    max_retries: int = 2
-    paddleocr_disable_mkldnn: bool = True  # tránh PIR/oneDNN crash trên Windows
+    use_paddleocr_for_latin: bool = True
+    use_manga_ocr_for_ja: bool = False       # disabled — PaddleOCR only
+    confidence_floor: float = 0.55           # raised for stricter filtering
+    confidence_secondary: float = 0.30
+    max_retries: int = 3                     # raised — more preprocessing attempts
+    paddleocr_disable_mkldnn: bool = True    # tránh PIR/oneDNN crash trên Windows
+    # Use server models for higher accuracy
+    use_server_model: bool = True
     preprocess_variants: tuple[str, ...] = field(
-        default_factory=lambda: ("default", "upscale2x", "denoise+sharpen",
-                                 "threshold", "rotate90"),
+        default_factory=lambda: ("raw", "default", "clahe", "upscale2x",
+                                 "denoise+sharpen", "threshold", "rotate90"),
     )
 
 
@@ -114,15 +112,13 @@ def _missing_engine_message(engine: str) -> str:
             "OCR backend PaddleOCR chưa sẵn sàng. "
             "Cài bằng: pip install paddleocr paddlepaddle"
         )
-    if engine == "manga_ocr":
-        return "OCR backend manga-ocr chưa sẵn sàng. Cài bằng: pip install manga-ocr"
     return f"OCR backend {engine!r} chưa sẵn sàng."
 
 
-# --------------------------- Engine adapters --------------------------- #
+# --------------------------- Engine adapter (PaddleOCR only) ------------ #
 
 class _EnginePaddleOCR:
-    """Wrap PaddleOCR (PP-OCRv5). Reuse predictor per lang.
+    """Wrap PaddleOCR (PP-OCRv5). Server models for accuracy. Reuse predictor per lang.
 
     Lang map (paddleocr 3.x):
       en, vi (→ en, latin script)  → 'en'
@@ -137,10 +133,11 @@ class _EnginePaddleOCR:
         "ja": "japan", "ko": "korean",
     }
 
-    def __init__(self, disable_mkldnn: bool = True):
+    def __init__(self, disable_mkldnn: bool = True, use_server: bool = True):
         self._predictor = None
         self._active_lang: Optional[str] = None
         self._disable_mkldnn = disable_mkldnn
+        self._use_server = use_server
         if disable_mkldnn:
             # Phải set TRƯỚC khi import paddle — nếu paddle đã load thì flag vô hiệu
             import os
@@ -153,18 +150,29 @@ class _EnginePaddleOCR:
                 return self._LANG_MAP[l]
         return "en"
 
-    # Mobile det model — đo trên chap 002: ~8s/page so với server_det ~13s
-    # (~40% nhanh hơn), quality identical hoặc tốt hơn nhẹ ("flock" vs "Plock"
-    # ở 1 case). Crop của manga bubble không nhỏ tới mức cần server_det.
-    _DET_MODEL_BY_LANG = {
+    # Server models — higher accuracy, optimal for manga OCR quality
+    _DET_MODEL_SERVER = {
+        "en": "PP-OCRv5_server_det",
+        "ch": "PP-OCRv5_server_det",
+        "japan": "PP-OCRv5_server_det",
+        "korean": "PP-OCRv5_server_det",
+    }
+    _REC_MODEL_SERVER = {
+        "en": "en_PP-OCRv5_server_rec",
+        "ch": "ch_PP-OCRv5_server_rec",
+        "japan": "japan_PP-OCRv5_server_rec",
+        "korean": "korean_PP-OCRv5_server_rec",
+    }
+
+    # Mobile fallback
+    _DET_MODEL_MOBILE = {
         "en": "PP-OCRv5_mobile_det",
         "ch": "PP-OCRv5_mobile_det",
         "japan": "PP-OCRv5_mobile_det",
         "korean": "PP-OCRv5_mobile_det",
     }
-    _REC_MODEL_BY_LANG = {
+    _REC_MODEL_MOBILE = {
         "en": "en_PP-OCRv5_mobile_rec",
-        # Để PaddleOCR tự pick mặc định cho ch/japan/korean (đã optimize)
     }
 
     def _ensure(self, paddle_lang: str):
@@ -176,10 +184,14 @@ class _EnginePaddleOCR:
                 use_doc_unwarping=False,
                 use_textline_orientation=False,
             )
-            det_model = self._DET_MODEL_BY_LANG.get(paddle_lang)
+            if self._use_server:
+                det_model = self._DET_MODEL_SERVER.get(paddle_lang)
+                rec_model = self._REC_MODEL_SERVER.get(paddle_lang)
+            else:
+                det_model = self._DET_MODEL_MOBILE.get(paddle_lang)
+                rec_model = self._REC_MODEL_MOBILE.get(paddle_lang)
             if det_model:
                 kwargs["text_detection_model_name"] = det_model
-            rec_model = self._REC_MODEL_BY_LANG.get(paddle_lang)
             if rec_model:
                 kwargs["text_recognition_model_name"] = rec_model
             if self._disable_mkldnn:
@@ -216,93 +228,55 @@ class _EnginePaddleOCR:
         return text, conf
 
 
-class _EnginePaddleOCRVL:
-    """Wrap PaddleOCR-VL-1.5 (Multimodal Vision-Language OCR)."""
-
-    def __init__(self):
-        self._predictor = None
-
-    def _ensure(self):
-        if self._predictor is None:
-            try:
-                from .paddle_cache import get_paddleocr
-            except ImportError as e:
-                raise RuntimeError("Cần cài paddleocr để dùng PaddleOCR-VL") from e
-            self._predictor = get_paddleocr(use_vl=True, lang="en", enable_mkldnn=False)
-        return self._predictor
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        predictor = self._ensure()
-        result = predictor.ocr(image, cls=False)
-        if not result or not result[0]:
-            return "", 0.0
-        
-        texts = [res[1][0] for res in result[0] if res[1]]
-        scores = [res[1][1] for res in result[0] if res[1]]
-        if not texts:
-            return "", 0.0
-            
-        return " ".join(texts), float(np.mean(scores))
-
-
-class _EngineMangaOCR:
-    """Wrap manga-ocr. Chuyên Nhật, accuracy cao trên kana + kanji + vertical."""
-
-    def __init__(self):
-        self._reader = None
-
-    def _ensure(self):
-        if self._reader is None:
-            from manga_ocr import MangaOcr
-            self._reader = MangaOcr()
-        return self._reader
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        del langs  # always Japanese
-        from PIL import Image
-        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else image
-        pil = Image.fromarray(rgb)
-        text = self._ensure()(pil)
-        # manga-ocr không trả conf — ước lượng theo length / không-empty
-        text = (text or "").strip()
-        conf = 0.85 if text else 0.0
-        return text, conf
-
-
-class _EngineMIT48px:
-    """Wrap MIT 48px OCR model cho low-res text."""
-
-    def __init__(self):
-        self._model = None
-
-    def _ensure(self):
-        if self._model is None:
-            # Stub: require external MIT OCR package
-            pass
-        return self._model
-
-    def read(self, image: np.ndarray, langs: tuple[str, ...]) -> tuple[str, float]:
-        # Implement MIT 48px logic here once package is available
-        # Currently falls back to empty
-        return "", 0.0
-
-
 # --------------------------- Preprocessing variants --------------------------- #
 
+def _variant_raw(crop: np.ndarray) -> np.ndarray:
+    """No preprocessing — raw crop. Often best for clean white bubbles."""
+    if crop.size == 0:
+        return crop
+    h, w = crop.shape[:2]
+    if h < 40:
+        scale = min(2.0, 60.0 / max(h, 1))
+        crop = cv2.resize(crop, (int(w * scale), int(h * scale)),
+                          interpolation=cv2.INTER_CUBIC)
+    return crop
+
+
 def _variant_default(crop: np.ndarray) -> np.ndarray:
-    """Light unsharp-mask (cường độ 1.5/-0.5) + upscale nếu nhỏ. Đổi từ
-    laplacian center=5 sang unsharp-mask để giảm phantom strokes — kernel cường
-    độ cao tạo edge ảo → OCR thấy chữ ảo → 'thêm chữ'."""
+    """Light unsharp-mask (1.3/-0.3) + upscale nếu nhỏ. Gentler than before
+    to reduce phantom strokes on clean manga bubbles."""
     if crop.size == 0:
         return crop
     blurred = cv2.GaussianBlur(crop, (0, 0), sigmaX=1.0)
-    sharp = cv2.addWeighted(crop, 1.5, blurred, -0.5, 0)
+    sharp = cv2.addWeighted(crop, 1.3, blurred, -0.3, 0)
     h, w = sharp.shape[:2]
     if h < 60:
         scale = min(2.0, 80.0 / max(h, 1))
         sharp = cv2.resize(sharp, (int(w * scale), int(h * scale)),
                            interpolation=cv2.INTER_CUBIC)
     return sharp
+
+
+def _variant_clahe(crop: np.ndarray) -> np.ndarray:
+    """CLAHE contrast enhancement — great for low-contrast manga scans."""
+    if crop.size == 0:
+        return crop
+    if crop.ndim == 3:
+        lab = cv2.cvtColor(crop, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        l = clahe.apply(l)
+        enhanced = cv2.merge([l, a, b])
+        result = cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
+    else:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        result = clahe.apply(crop)
+    h, w = result.shape[:2]
+    if h < 60:
+        scale = min(2.0, 80.0 / max(h, 1))
+        result = cv2.resize(result, (int(w * scale), int(h * scale)),
+                            interpolation=cv2.INTER_CUBIC)
+    return result
 
 
 def _variant_upscale2x(crop: np.ndarray) -> np.ndarray:
@@ -317,9 +291,9 @@ def _variant_denoise_sharpen(crop: np.ndarray) -> np.ndarray:
         return crop
     denoised = cv2.fastNlMeansDenoisingColored(crop, None, 7, 7, 5, 11) \
         if crop.ndim == 3 else cv2.fastNlMeansDenoising(crop, None, 7, 5, 11)
-    # Unsharp-mask thay laplacian — bớt phantom strokes
+    # Gentler unsharp-mask — 1.3/-0.3 instead of 1.5/-0.5
     blurred = cv2.GaussianBlur(denoised, (0, 0), sigmaX=1.0)
-    sharp = cv2.addWeighted(denoised, 1.5, blurred, -0.5, 0)
+    sharp = cv2.addWeighted(denoised, 1.3, blurred, -0.3, 0)
     return _variant_upscale2x(sharp) if sharp.shape[0] < 60 else sharp
 
 
@@ -343,7 +317,9 @@ def _variant_rotate90(crop: np.ndarray) -> np.ndarray:
 
 
 _VARIANT_FN: dict[str, Callable[[np.ndarray], np.ndarray]] = {
+    "raw": _variant_raw,
     "default": _variant_default,
+    "clahe": _variant_clahe,
     "upscale2x": _variant_upscale2x,
     "denoise+sharpen": _variant_denoise_sharpen,
     "threshold": _variant_threshold,
@@ -351,10 +327,10 @@ _VARIANT_FN: dict[str, Callable[[np.ndarray], np.ndarray]] = {
 }
 
 
-# --------------------------- Router --------------------------- #
+# --------------------------- Router (PaddleOCR only) ------------------- #
 
 class OCRRouter:
-    """Dispatch theo language + confidence. Lazy init engines."""
+    """PaddleOCR-only dispatcher with multi-variant retry. Lazy init engine."""
 
     def __init__(self, ocr_cfg: OCRConfig,
                  router_cfg: Optional[OCRRouterConfig] = None):
@@ -362,13 +338,6 @@ class OCRRouter:
         self.router_cfg = router_cfg or OCRRouterConfig()
         self._log = get_logger()
         self._paddleocr: Optional[_EnginePaddleOCR] = None
-        self._paddleocr_vl: Optional[_EnginePaddleOCRVL] = None
-        self._manga_ocr: Optional[_EngineMangaOCR] = None
-        self._mit_48px: Optional[_EngineMIT48px] = None
-        # Track engine availability — đánh dấu False sau lần đầu fail load
-        self._available = {"paddleocr": None,
-                           "manga_ocr": None,
-                           "paddleocr_vl": None, "mit_48px": None}
 
     # --------------------------- Public --------------------------- #
 
@@ -418,99 +387,49 @@ class OCRRouter:
 
     def read_crop(self, crop: np.ndarray,
                   detection: LanguageDetection) -> OCRResult:
-        """OCR 1 crop với routing + retry."""
-        primary, secondary = self._choose_engines(detection)
+        """OCR 1 crop với multi-variant retry. PaddleOCR only."""
         cfg = self.router_cfg
+
+        if not self._is_available():
+            raise OCRBackendUnavailable(_missing_engine_message("paddleocr"))
 
         best: Optional[OCRResult] = None
         for variant_name in cfg.preprocess_variants[: cfg.max_retries + 1]:
-            processed = _VARIANT_FN.get(variant_name, _variant_default)(crop)
-            text, conf = self._try_engine(primary, processed, detection.langs)
+            processed = _VARIANT_FN.get(variant_name, _variant_raw)(crop)
+            text, conf = self._try_engine(processed, detection.langs)
             r = OCRResult(text=text, confidence=conf,
-                          engine=primary, variant=variant_name)
+                          engine="paddleocr", variant=variant_name)
             if best is None or conf > best.confidence:
                 best = r
             if conf >= cfg.confidence_floor and text:
                 return r
-            # Nếu primary fail sâu → thử secondary trên cùng variant.
-            if conf < cfg.confidence_secondary and secondary and secondary != primary:
-                text2, conf2 = self._try_engine(secondary, processed, detection.langs)
-                if conf2 > best.confidence:
-                    best = OCRResult(text=text2, confidence=conf2,
-                                     engine=secondary, variant=variant_name)
-                if conf2 >= cfg.confidence_floor and text2:
-                    return best
         return best or OCRResult(text="", confidence=0.0,
-                                 engine=primary, variant="default")
+                                 engine="paddleocr", variant="raw")
 
     def release(self) -> None:
         self._paddleocr = None
-        self._paddleocr_vl = None
-        self._manga_ocr = None
-        self._mit_48px = None
 
     # --------------------------- Internals --------------------------- #
 
-    def _choose_engines(self, detection: LanguageDetection
-                        ) -> tuple[str, Optional[str]]:
-        """Return (primary, secondary) engine names."""
-        cfg = self.router_cfg
-        if cfg.engine != "auto":
-            if not self._is_available(cfg.engine):
-                raise OCRBackendUnavailable(_missing_engine_message(cfg.engine))
-            return cfg.engine, None
-
-        if self._is_available("paddleocr"):
-            return "paddleocr", None
-
-        raise OCRBackendUnavailable(_missing_engine_message("paddleocr"))
-
-    def _is_available(self, engine: str) -> bool:
-        if self._available[engine] is not None:
-            return self._available[engine]
+    def _is_available(self) -> bool:
         try:
-            if engine in ("paddleocr", "paddleocr_vl"):
-                if importlib.util.find_spec("paddleocr") is None:
-                    raise ImportError("paddleocr")
-            elif engine == "manga_ocr":
-                if importlib.util.find_spec("manga_ocr") is None:
-                    raise ImportError("manga_ocr")
-            elif engine == "mit_48px":
-                pass # check logic cho mit_48px package
-            self._available[engine] = True
-        except ImportError:
-            self._available[engine] = False
-            self._log.debug(f"   [OCRRouter] {engine} không cài → disable")
-        except Exception as e:  # noqa: BLE001 — paddleocr có thể crash khi import
-            self._available[engine] = False
-            self._log.debug(f"   [OCRRouter] {engine} import lỗi: {e} → disable")
-        return self._available[engine]
+            if importlib.util.find_spec("paddleocr") is None:
+                return False
+            return True
+        except Exception:  # noqa: BLE001
+            return False
 
-    def _try_engine(self, name: str, crop: np.ndarray,
+    def _try_engine(self, crop: np.ndarray,
                     langs: tuple[str, ...]) -> tuple[str, float]:
         try:
-            if name == "paddleocr":
-                if self._paddleocr is None:
-                    self._paddleocr = _EnginePaddleOCR(
-                        disable_mkldnn=self.router_cfg.paddleocr_disable_mkldnn)
-                return self._paddleocr.read(crop, langs)
-            if name == "paddleocr_vl":
-                if self._paddleocr_vl is None:
-                    self._paddleocr_vl = _EnginePaddleOCRVL()
-                return self._paddleocr_vl.read(crop, langs)
-            if name == "manga_ocr":
-                if self._manga_ocr is None:
-                    self._manga_ocr = _EngineMangaOCR()
-                return self._manga_ocr.read(crop, langs)
-            if name == "mit_48px":
-                if self._mit_48px is None:
-                    self._mit_48px = _EngineMIT48px()
-                return self._mit_48px.read(crop, langs)
+            if self._paddleocr is None:
+                self._paddleocr = _EnginePaddleOCR(
+                    disable_mkldnn=self.router_cfg.paddleocr_disable_mkldnn,
+                    use_server=self.router_cfg.use_server_model)
+            return self._paddleocr.read(crop, langs)
         except (ImportError, ModuleNotFoundError, OSError) as e:
-            if name in self._available:
-                self._available[name] = False
-            self._log.warning(f"   [OCRRouter] engine {name} fail: {e}")
-            raise OCRBackendUnavailable(_missing_engine_message(name)) from e
+            self._log.warning(f"   [OCRRouter] paddleocr fail: {e}")
+            raise OCRBackendUnavailable(_missing_engine_message("paddleocr")) from e
         except Exception as e:  # noqa: BLE001
-            self._log.warning(f"   [OCRRouter] engine {name} OCR crop fail: {e}")
+            self._log.warning(f"   [OCRRouter] paddleocr OCR crop fail: {e}")
         return "", 0.0

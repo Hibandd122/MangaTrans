@@ -229,9 +229,9 @@ class LanguageDetector:
         """Preview OCR mỗi candidate combo → glyph + conf score.
 
         Trả (scores_per_code, glyph_counts_across_all, mixed_flag).
+        Uses PaddleOCR v3 predict() API.
         """
         try:
-            from paddleocr import PaddleOCR
             from .paddle_cache import get_paddleocr
         except ImportError as e:
             raise RuntimeError("Cần cài paddleocr") from e
@@ -257,8 +257,12 @@ class LanguageDetector:
             if not plang:
                 continue
             try:
-                # Bắt buộc enable_mkldnn=False để tránh crash mộtDNN PIR trên Windows
-                reader = get_paddleocr(use_angle_cls=True, lang=plang, enable_mkldnn=False)
+                reader = get_paddleocr(
+                    lang=plang, enable_mkldnn=False,
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                )
             except Exception as e:  # noqa: BLE001
                 self._log.debug(f"   [LangDetect] init {cand['name']} fail: {e}")
                 continue
@@ -268,16 +272,24 @@ class LanguageDetector:
             cjk_punct_hits = 0
             for crop in crops:
                 try:
-                    res = reader.ocr(crop, cls=True)
+                    res = reader.predict(crop)
                 except Exception:  # noqa: BLE001
                     continue
-                if not res or not res[0]:
+                if not res:
                     continue
-                
-                lines = res[0]
-                confs.append(sum(r[1][1] for r in lines) / len(lines))
-                for r in lines:
-                    text = r[1][0]
+
+                # PaddleOCR v3 predict() returns list of dict
+                item = res[0] if isinstance(res, list) else res
+                if not isinstance(item, dict):
+                    continue
+                texts = item.get("rec_texts") or []
+                rec_scores = item.get("rec_scores") or []
+                if not texts:
+                    continue
+
+                if rec_scores:
+                    confs.append(float(np.mean(rec_scores)))
+                for text in texts:
                     for ch in text:
                         if ch in CJK_PUNCT:
                             cjk_punct_hits += 1

@@ -147,7 +147,7 @@ class Translator:
 
     def translate_batch(self, texts: list[str],
                         position_tags: Optional[list[str]] = None) -> list[str]:
-        """Dịch list text → list translated theo đúng thứ tự."""
+        """Dịch list text → list translated theo đúng thứ tự. Retry JSON parse once."""
         if not texts:
             return []
         api_key = self.resolve_api_key()
@@ -163,7 +163,17 @@ class Translator:
             prompt, api_key, model,
             cfg.timeout, cfg.max_retries, cfg.temperature, cfg.top_p, self._log,
         )
-        translations = _parse_translations(raw_text, len(texts), self._log)
+        try:
+            translations = _parse_translations(raw_text, len(texts), self._log)
+        except RuntimeError:
+            # Retry once with stricter prompt on JSON parse failure
+            self._log.warning("⚠️  JSON parse failed, retrying with stricter prompt...")
+            retry_prompt = prompt + "\n\nIMPORTANT: Return ONLY a valid JSON array. No markdown, no explanation."
+            raw_text = _call_openrouter(
+                retry_prompt, api_key, model,
+                cfg.timeout, cfg.max_retries, cfg.temperature * 0.5, cfg.top_p, self._log,
+            )
+            translations = _parse_translations(raw_text, len(texts), self._log)
         if cfg.use_glossary:
             new_pairs = extract_glossary_entries(texts, translations)
             if new_pairs:
@@ -251,7 +261,7 @@ def _call_openrouter(prompt: str, api_key: str, model: str,
 
 def _http_post_json(url: str, headers: dict, payload: dict,
                     timeout: int, max_retries: int, log, label: str) -> str:
-    """POST JSON → response body. Retry 429 với delay từ header/body."""
+    """POST JSON → response body. Retry 429/502/503/504 với delay."""
     headers = dict(headers)
     headers.setdefault("User-Agent", "mangatrans/0.1 (+https://github.com/)")
     data_bytes = json.dumps(payload).encode("utf-8")
@@ -272,7 +282,23 @@ def _http_post_json(url: str, headers: dict, payload: dict,
                 )
                 time.sleep(delay)
                 continue
+            if e.code in (502, 503, 504) and attempt < max_retries - 1:
+                log.warning(
+                    f"   [{label}] API báo lỗi {e.code} (Gateway/Timeout), đợi 5s rồi thử lại "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(5)
+                continue
             raise RuntimeError(f"{label} API HTTP {e.code}: {err_body[:500]}")
+        except (urllib.error.URLError, TimeoutError) as e:
+            if attempt < max_retries - 1:
+                log.warning(
+                    f"   [{label}] Lỗi mạng/Timeout ({e}), đợi 5s rồi thử lại "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+                time.sleep(5)
+                continue
+            raise RuntimeError(f"{label} API lỗi mạng: {e}")
     raise RuntimeError(f"{label} API không phản hồi sau khi retry.")
 
 
@@ -469,9 +495,13 @@ class TranslationPipeline:
 
         if cfg.sfx_skip_preserve_pixels:
             kept = [i for i, r in enumerate(ocr_results)
-                    if not r.get("should_preserve_pixels")]
+                    if not r.get("should_preserve_pixels")
+                    and r.get("should_translate", True) is not False
+                    and (r.get("text") or "").strip()]
         else:
-            kept = list(range(len(ocr_results)))
+            kept = [i for i, r in enumerate(ocr_results)
+                    if r.get("should_translate", True) is not False
+                    and (r.get("text") or "").strip()]
 
         if not kept:
             return [""] * len(ocr_results)

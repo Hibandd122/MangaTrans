@@ -157,7 +157,7 @@ class Translator:
 
     def translate_batch(self, texts: list[str],
                         position_tags: Optional[list[str]] = None) -> list[str]:
-        """Dịch list text → list translated theo đúng thứ tự."""
+        """Dịch list text → list translated theo đúng thứ tự. Retry JSON parse once."""
         if not texts:
             return []
         cfg = self.config
@@ -165,7 +165,14 @@ class Translator:
 
         prompt = _build_prompt(texts, cfg.target_lang, glossary, position_tags)
         raw_text = self.backend.generate(prompt)
-        translations = _parse_translations(raw_text, len(texts), self._log)
+        try:
+            translations = _parse_translations(raw_text, len(texts), self._log)
+        except RuntimeError:
+            # Retry once with stricter prompt on JSON parse failure
+            self._log.warning("⚠️  JSON parse failed, retrying with stricter prompt...")
+            retry_prompt = prompt + "\n\nIMPORTANT: Return ONLY a valid JSON array. No markdown, no explanation."
+            raw_text = self.backend.generate(retry_prompt)
+            translations = _parse_translations(raw_text, len(texts), self._log)
         if cfg.use_glossary:
             new_pairs = extract_glossary_entries(texts, translations)
             if new_pairs:
